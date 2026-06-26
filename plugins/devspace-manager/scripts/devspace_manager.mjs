@@ -681,6 +681,7 @@ async function runChecks(status, options = {}) {
   const localBase = `http://127.0.0.1:${status.port}`;
   const publicBase = status.publicBaseUrl;
   const checks = [];
+  checks.push(devspaceDoctorCheck());
   checks.push(check("devspace process alive", isAlive(status.devspacePid)));
   if (status.cloudflaredPid) checks.push(check("cloudflared process alive", isAlive(status.cloudflaredPid)));
   checks.push(check("config file exists", existsSync(CONFIG_PATH)));
@@ -699,6 +700,20 @@ async function runChecks(status, options = {}) {
     checks.push(...await mcpSmokeChecks(status, options));
   }
   return checks;
+}
+
+function devspaceDoctorCheck() {
+  const result = spawnSync("devspace", ["doctor"], {
+    encoding: "utf8",
+    timeout: DEFAULT_HTTP_TIMEOUT_MS,
+    maxBuffer: 1024 * 1024,
+  });
+  return check("devspace doctor", result.status === 0 && !result.error, {
+    exitCode: result.status,
+    stdout: preview(result.stdout),
+    stderr: preview(result.stderr),
+    error: result.error?.message,
+  });
 }
 
 async function mcpSmokeChecks(status, options = {}) {

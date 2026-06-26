@@ -275,8 +275,10 @@ async function harness(options) {
   const ok = checks.every((check) => check.ok);
   const result = {
     ok,
+    publicBaseUrl: started.publicBaseUrl,
     publicMcpUrl: `${started.publicBaseUrl}/mcp`,
     localMcpUrl: `http://127.0.0.1:${started.port}/mcp`,
+    tunnelProvider: started.tunnelProvider,
     allowedRoots: started.allowedRoots,
     checks,
     ownerTokenCommand: "jq -r .ownerToken ~/.devspace/auth.json",
@@ -327,6 +329,7 @@ async function task(options) {
     exchangeRoot,
     resultFileName,
     doneToken,
+    promptId: taskId,
     allowEdits: Boolean(options.allowEdits),
   });
   const outputDir = resolve(options.outputDir ?? TASKS_DIR);
@@ -361,6 +364,7 @@ async function task(options) {
     exchangeRoot,
     chatGptResultPath: resultFilePath,
     ownerTokenCommand: "jq -r .ownerToken ~/.devspace/auth.json",
+    connectorSetup: connectorSetupForStatus(started),
     checks,
     send: sendResult,
     chatGptPrompt: options.printPrompt ? chatGptPrompt : undefined,
@@ -416,6 +420,7 @@ async function chatGptLiveCheck(options) {
     exchangeRoot,
     relativeMarkerPath,
     resultFileName,
+    promptId: taskId,
   });
   writeFileSync(promptPath, chatGptPrompt, { mode: 0o600 });
   chmodSync(promptPath, 0o600);
@@ -457,6 +462,8 @@ async function chatGptLiveCheck(options) {
     resultPath,
     exchangeRoot,
     chatGptResultPath: resultFilePath,
+    ownerTokenCommand: "jq -r .ownerToken ~/.devspace/auth.json",
+    connectorSetup: connectorSetupForStatus(started),
     checks,
     send: sendResult,
     reason: markerFound
@@ -566,7 +573,9 @@ async function startOnce(options, lifecycle = { changedRuntimeState: false }) {
       localMcpUrl: status.localMcpUrl,
       allowedRoots: status.allowedRoots,
       devspacePid: status.devspacePid,
+      tunnelProvider: status.tunnelProvider,
       cloudflaredPid: status.cloudflaredPid,
+      localtunnelPid: status.localtunnelPid,
       ownerTokenCommand: "jq -r .ownerToken ~/.devspace/auth.json",
       logs: status.logs,
     });
@@ -1178,6 +1187,14 @@ function prepareExchangeRoot(taskId) {
   return exchangeRoot;
 }
 
+function connectorSetupForStatus(status) {
+  return {
+    connectorUrl: status.publicMcpUrl,
+    ownerTokenCommand: "jq -r .ownerToken ~/.devspace/auth.json",
+    description: "Add this URL as a ChatGPT MCP connector, then authorize with the Owner password from the local command.",
+  };
+}
+
 function appendRootOption(rawRoots, extraRoot) {
   const roots = parseRoots(rawRoots);
   if (!roots.includes(extraRoot)) roots.push(extraRoot);
@@ -1234,7 +1251,7 @@ function isSmallTextProbe(path) {
   return TEXT_PROBE_EXTENSIONS.has(extension);
 }
 
-function buildChatGptTaskPrompt({ task, status, root, exchangeRoot, resultFileName, doneToken, allowEdits }) {
+function buildChatGptTaskPrompt({ task, status, root, exchangeRoot, resultFileName, doneToken, promptId, allowEdits }) {
   const editInstruction = allowEdits
     ? "You may edit files through DevSpace when the fix is clear. Prefer targeted edit calls over full rewrites. After edits, run the relevant tests and summarize the exact files changed."
     : "Do not edit files unless I explicitly follow up asking you to do so. Return verified findings and concrete fix guidance; Codex will implement locally.";
@@ -1242,6 +1259,7 @@ function buildChatGptTaskPrompt({ task, status, root, exchangeRoot, resultFileNa
     "# DevSpace Delegated Coding Task",
     "",
     "You are ChatGPT working with the DevSpace MCP connector. Use DevSpace to inspect this local codebase directly. Do not ask for a zip, file upload, pasted source, screenshots, or manual download.",
+    `Prompt ID: DEVSPACE_MANAGER_PROMPT_ID ${promptId}`,
     "",
     "Connector details:",
     `- MCP connector URL: ${status.publicMcpUrl}`,
@@ -1273,11 +1291,12 @@ function buildChatGptTaskPrompt({ task, status, root, exchangeRoot, resultFileNa
   ].join("\n");
 }
 
-function buildChatGptLiveCheckPrompt({ status, root, exchangeRoot, relativeMarkerPath, resultFileName }) {
+function buildChatGptLiveCheckPrompt({ status, root, exchangeRoot, relativeMarkerPath, resultFileName, promptId }) {
   return [
     "# DevSpace Live Connector Check",
     "",
     "You are ChatGPT with a DevSpace MCP connector. This is an end-to-end connector check.",
+    `Prompt ID: DEVSPACE_MANAGER_PROMPT_ID ${promptId}`,
     "",
     "Connector details:",
     `- MCP connector URL: ${status.publicMcpUrl}`,
@@ -1362,7 +1381,10 @@ async function sendPromptWithChatGptApp({ prompt, timeoutMs, resultFilePath, exp
     const appSnapshotResult = readChatGptAppAssistantSnapshot(prompt);
     if (appSnapshotResult.ok) {
       lastAppSnapshotError = null;
-      lastAppSnapshot = appSnapshotResult.snapshot;
+      lastAppSnapshot = {
+        ...appSnapshotResult.snapshot,
+        promptMatched: appSnapshotResult.promptMatched,
+      };
       if (appSnapshotResult.assistantText !== lastAppAssistantText) {
         lastAppAssistantText = appSnapshotResult.assistantText;
       }
@@ -1426,6 +1448,7 @@ async function sendPromptWithChatGptApp({ prompt, timeoutMs, resultFilePath, exp
 function readChatGptAppAssistantSnapshot(prompt) {
   try {
     const state = runChatGptSnapshotAx();
+    const promptMatched = transcriptContainsPrompt(state, prompt);
     const assistantText = extractAssistantTextFromAppState(state, prompt);
     const complete = isAppResponseCompleteSnapshot({
       assistantText,
@@ -1435,6 +1458,7 @@ function readChatGptAppAssistantSnapshot(prompt) {
       ok: true,
       assistantText,
       complete,
+      promptMatched,
       snapshot: publicChatGptSnapshot(state),
     };
   } catch (error) {
@@ -1477,26 +1501,14 @@ function runChatGptSnapshotAx() {
 }
 
 function extractAssistantTextFromAppState(state = {}, prompt = "") {
-  const promptNeedle = normalizeForMatch(prompt);
   const transcript = Array.isArray(state.transcriptTexts)
     ? state.transcriptTexts
     : [];
-  let promptIndex = -1;
+  const promptIndex = findPromptIndexInTranscript(transcript, prompt);
+  if (promptIndex < 0) return "";
+  const promptNeedle = normalizeForMatch(prompt);
 
-  for (let index = transcript.length - 1; index >= 0; index -= 1) {
-    const text = normalizeForMatch(transcript[index]?.text ?? transcript[index]);
-    if (!text) continue;
-    if (
-      text === promptNeedle ||
-      (promptNeedle.length >= 80 && text.includes(promptNeedle.slice(0, 80))) ||
-      (text.length >= 80 && promptNeedle.includes(text.slice(0, 80)))
-    ) {
-      promptIndex = index;
-      break;
-    }
-  }
-
-  const candidates = (promptIndex >= 0 ? transcript.slice(promptIndex + 1) : transcript)
+  const candidates = transcript.slice(promptIndex + 1)
     .map((entry) => String(entry?.text ?? entry ?? "").trim())
     .filter(Boolean)
     .filter((text) => !isAppUiText(text))
@@ -1504,6 +1516,37 @@ function extractAssistantTextFromAppState(state = {}, prompt = "") {
     .filter((text) => !isAppTransientText(text));
 
   return normalizeAssistantText(dedupeAdjacent(candidates).join("\n"));
+}
+
+function transcriptContainsPrompt(state = {}, prompt = "") {
+  const transcript = Array.isArray(state.transcriptTexts)
+    ? state.transcriptTexts
+    : [];
+  return findPromptIndexInTranscript(transcript, prompt) >= 0;
+}
+
+function findPromptIndexInTranscript(transcript, prompt) {
+  for (let index = transcript.length - 1; index >= 0; index -= 1) {
+    const text = normalizeForMatch(transcript[index]?.text ?? transcript[index]);
+    if (!text) continue;
+    if (textMatchesPrompt(text, prompt)) return index;
+  }
+  return -1;
+}
+
+function textMatchesPrompt(normalizedText, prompt) {
+  const ids = promptIdentityNeedles(prompt);
+  if (ids.length > 0) return ids.some((id) => normalizedText.includes(id));
+  const promptNeedle = normalizeForMatch(prompt);
+  return normalizedText === promptNeedle ||
+    (promptNeedle.length >= 80 && normalizedText.includes(promptNeedle.slice(0, 80))) ||
+    (normalizedText.length >= 80 && promptNeedle.includes(normalizedText.slice(0, 80)));
+}
+
+function promptIdentityNeedles(prompt) {
+  return [...String(prompt ?? "").matchAll(/DEVSPACE_MANAGER_PROMPT_ID\s+\S+/g)]
+    .map((match) => normalizeForMatch(match[0]))
+    .filter(Boolean);
 }
 
 function isAppResponseCompleteSnapshot({ assistantText, isAnswering }) {

@@ -630,6 +630,7 @@ async function stop({ print }) {
   if (pidFileCloudflaredPid && pidFileCloudflaredPid !== status?.cloudflaredPid) {
     killed.push(...killPidGroup(pidFileCloudflaredPid, "cloudflared"));
   }
+  await waitForKilledProcesses(killed);
   safeRemoveFile(STATUS_PATH, "managed status file");
   safeRemoveFile(join(MANAGER_DIR, "cloudflared.pid"), "managed cloudflared pid file");
   const ok = killed.every((entry) => !entry.error);
@@ -2035,6 +2036,48 @@ function killPidGroup(pid, name) {
     }
   }
   return killed;
+}
+
+async function waitForKilledProcesses(killed) {
+  const entries = killed.filter((entry) => !entry.error && Number.isInteger(entry.pid));
+  if (entries.length === 0) return;
+  if (await waitUntilProcessesExit(entries, 5_000)) return;
+
+  for (const entry of entries) {
+    if (!isKillTargetAlive(entry.pid)) continue;
+    try {
+      process.kill(entry.pid, "SIGKILL");
+      entry.escalated = "SIGKILL";
+    } catch (error) {
+      if (error?.code !== "ESRCH") entry.error = `SIGKILL failed: ${error.message}`;
+    }
+  }
+  await waitUntilProcessesExit(entries.filter((entry) => !entry.error), 2_000);
+  for (const entry of entries) {
+    if (!entry.error && isKillTargetAlive(entry.pid)) {
+      entry.error = "Process did not exit after SIGTERM/SIGKILL.";
+    }
+  }
+}
+
+async function waitUntilProcessesExit(entries, timeoutMs) {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    if (entries.every((entry) => !isKillTargetAlive(entry.pid))) return true;
+    await sleep(100);
+  }
+  return entries.every((entry) => !isKillTargetAlive(entry.pid));
+}
+
+function isKillTargetAlive(pid) {
+  if (!Number.isInteger(pid) || pid === 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if (error?.code === "EPERM") return true;
+    return false;
+  }
 }
 
 function isAlive(pid) {

@@ -516,9 +516,7 @@ async function startOnce(options, lifecycle = { changedRuntimeState: false }) {
     if (checks.localDiscovery && checks.publicDiscovery) return existing;
   }
 
-  const reusableTunnel = canReuseManagedTunnelForRestart(existing, { port, options })
-    ? existing
-    : null;
+  const reusableTunnel = await reusableManagedTunnelForRestart(existing, { port, options });
   if (reusableTunnel?.devspacePid) {
     await waitForKilledProcesses(killPidGroup(reusableTunnel.devspacePid, "devspace"));
   } else {
@@ -606,12 +604,14 @@ function managedTunnelAlive(status) {
   return true;
 }
 
-function canReuseManagedTunnelForRestart(status, { port, options }) {
+async function reusableManagedTunnelForRestart(status, { port, options }) {
   if (!status || status.port !== port) return false;
   if (options.publicBaseUrl || options.noTunnel) return false;
   if (status.tunnelProvider !== "cloudflared" && status.tunnelProvider !== "localtunnel") return false;
   if (!status.publicBaseUrl?.startsWith("https://")) return false;
-  return managedTunnelAlive(status);
+  if (!managedTunnelAlive(status)) return null;
+  const checks = await quickReachability(status.publicBaseUrl, status.port);
+  return checks.publicDiscovery ? status : null;
 }
 
 function sameStringArray(left, right) {

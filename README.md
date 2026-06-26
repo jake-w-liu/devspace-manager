@@ -15,7 +15,7 @@ DevSpace Manager does not upload project archives to ChatGPT. It starts a local 
 - Verifies `/mcp` returns `401` without OAuth, so the endpoint is not open.
 - Deep-tests OAuth token exchange and MCP calls against the allowed root.
 - Generates delegated task prompts for ChatGPT, sends them through its own ChatGPT app sender, and waits for ChatGPT to write results back through a DevSpace exchange root so Codex can outsource audits or fixes without zip upload/download. If ChatGPT can read through DevSpace but cannot write the result file, DevSpace Manager also captures the ChatGPT app transcript as a fallback response channel.
-- Uses automatic ChatGPT delivery by default: hidden Accessibility first, visible Accessibility next, visible keyboard paste last, then hides ChatGPT again after visible submission.
+- Uses automatic ChatGPT delivery by default: hidden Accessibility first, visible Accessibility next, visible keyboard paste last, then hides ChatGPT again after visible submission. If the macOS console session is locked, it fails fast with a `CHATGPT_SCREEN_LOCKED` diagnostic instead of attempting unsafe paste automation.
 
 ## Install In Codex
 
@@ -104,7 +104,9 @@ node scripts/devspace_manager.mjs task --roots "$PWD" --send chatgpt-app-auto "d
 
 `chatgpt-app-auto` tries hidden Accessibility first. If ChatGPT does not expose a hidden composer,
 it falls back to visible Accessibility automation and then visible keyboard paste. Visible fallback
-is transient: after submitting, the manager hides ChatGPT again. Use `--send chatgpt-app-hidden` to
+is transient: after submitting, the manager hides ChatGPT again. When the macOS console session is
+locked, GUI delivery stops before paste/keyboard automation and reports `CHATGPT_SCREEN_LOCKED`.
+Use `--send chatgpt-app-hidden` to
 require hidden-only behavior, or `--send chatgpt-app-visible` to force visible automation.
 
 Use `--send none` only when you want DevSpace Manager to prepare the prompt/result metadata without

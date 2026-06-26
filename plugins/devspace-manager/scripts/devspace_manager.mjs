@@ -1198,7 +1198,11 @@ function selfTest() {
   assertCheck("SSE response selects expected JSON-RPC id", parseMcpResponse(interleavedSse, "7").result.ok === true);
   assertCheck("SSE response without expected id returns latest event", parseMcpResponse(interleavedSse).id === 8);
   assertJsonRpcOk({ status: 200, json: { jsonrpc: "2.0", id: 11, result: null } }, "null result");
+  assertJsonRpcOk({ status: 200, json: { jsonrpc: "2.0", id: 12, result: false } }, "false result");
+  assertJsonRpcOk({ status: 200, json: { jsonrpc: "2.0", id: 13, result: 0 } }, "zero result");
   assertCheck("JSON-RPC null result is accepted", true);
+  assertCheck("JSON-RPC false result is accepted", true);
+  assertCheck("JSON-RPC zero result is accepted", true);
 
   const multilineSse = [
     "event: message",
@@ -3781,6 +3785,8 @@ The task command starts and verifies DevSpace, writes a ChatGPT-ready delegated 
 and sends that prompt through DevSpace Manager's built-in ChatGPT app control channel by default.
 The default sender is automatic: it tries hidden Accessibility first, then visible Accessibility,
 then visible keyboard paste, and hides ChatGPT again after visible submission.
+If the macOS console session is locked, ChatGPT GUI delivery fails fast with CHATGPT_SCREEN_LOCKED
+after DevSpace preflight instead of attempting unsafe paste automation.
 Use --send none only to generate the prompt/result metadata without contacting ChatGPT.
 The debug/audit/review/fix/analyze aliases use the same task flow and default to --send chatgpt-app-auto.
 Only one start/stop/task/harness command may run at a time.

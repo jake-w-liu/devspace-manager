@@ -123,6 +123,9 @@ async function runCommand(command, options) {
     case "doctor":
       await doctor();
       return;
+    case "self-test":
+      selfTest();
+      return;
     case "harness":
       await harness(options);
       return;
@@ -1084,7 +1087,7 @@ async function mcpRpc({ url, accessToken, sessionId, payload, allowEmpty = false
   if (!text && allowEmpty) {
     return { status: response.status, sessionId: response.headers.get("mcp-session-id") ?? sessionId, json: null };
   }
-  const json = parseMcpResponse(text);
+  const json = parseMcpResponse(text, payload?.id);
   return {
     status: response.status,
     sessionId: response.headers.get("mcp-session-id") ?? sessionId,
@@ -1111,17 +1114,114 @@ async function callMcpTool({ url, accessToken, sessionId, id, name, arguments: t
   return response;
 }
 
-function parseMcpResponse(text) {
-  const dataLines = text
-    .split(/\r?\n/)
-    .filter((line) => line.startsWith("data: "))
-    .map((line) => line.slice("data: ".length));
-  const payload = dataLines.length > 0 ? dataLines.join("\n") : text;
+function parseMcpResponse(text, expectedId = undefined) {
+  const dataEvents = parseSseDataEvents(text);
+  if (dataEvents.length > 0) {
+    const parsed = [];
+    for (const eventPayload of dataEvents) {
+      try {
+        parsed.push(JSON.parse(eventPayload));
+      } catch {}
+    }
+    if (expectedId !== undefined) {
+      const matched = parsed.find((item) => jsonRpcIdEquals(item?.id, expectedId));
+      if (matched) return matched;
+      const errorEvent = parsed.find((item) => item?.error);
+      if (errorEvent) return errorEvent;
+      if (parsed.length > 0) {
+        throw new Error(`MCP response did not include JSON-RPC id ${JSON.stringify(expectedId)}: ${preview(text)}`);
+      }
+    }
+    if (parsed.length > 0) return parsed.at(-1);
+  }
+  const payload = dataEvents.length > 0 ? dataEvents.join("\n") : text;
   try {
     return JSON.parse(payload);
   } catch {
     throw new Error(`MCP returned non-JSON payload: ${preview(text)}`);
   }
+}
+
+function parseSseDataEvents(text) {
+  const events = [];
+  let data = [];
+  const flush = () => {
+    if (data.length === 0) return;
+    const payload = data.join("\n").trim();
+    if (payload && payload !== "[DONE]") events.push(payload);
+    data = [];
+  };
+  for (const line of text.split(/\r?\n/)) {
+    if (line === "") {
+      flush();
+    } else if (line.startsWith("data:")) {
+      const value = line.slice("data:".length);
+      data.push(value.startsWith(" ") ? value.slice(1) : value);
+    }
+  }
+  flush();
+  return events;
+}
+
+function jsonRpcIdEquals(left, right) {
+  if (left === right) return true;
+  const leftType = typeof left;
+  const rightType = typeof right;
+  if ((leftType === "number" && rightType === "string") || (leftType === "string" && rightType === "number")) {
+    return String(left) === String(right);
+  }
+  return false;
+}
+
+function selfTest() {
+  const checks = [];
+  const assertCheck = (name, condition) => {
+    checks.push({ name, ok: Boolean(condition) });
+    if (!condition) throw new Error(`self-test failed: ${name}`);
+  };
+
+  assertCheck("plain JSON MCP response parses", parseMcpResponse('{"jsonrpc":"2.0","id":1,"result":{"ok":true}}', 1).result.ok === true);
+
+  const interleavedSse = [
+    "event: message",
+    'data: {"jsonrpc":"2.0","method":"notifications/progress","params":{"progress":1}}',
+    "",
+    "event: message",
+    'data: {"jsonrpc":"2.0","id":7,"result":{"ok":true}}',
+    "",
+    "event: message",
+    'data: {"jsonrpc":"2.0","id":8,"result":{"wrong":true}}',
+    "",
+    "data: [DONE]",
+    "",
+  ].join("\n");
+  assertCheck("SSE response selects expected JSON-RPC id", parseMcpResponse(interleavedSse, "7").result.ok === true);
+  assertCheck("SSE response without expected id returns latest event", parseMcpResponse(interleavedSse).id === 8);
+
+  const multilineSse = [
+    "event: message",
+    'data: {"jsonrpc":"2.0",',
+    'data: "id":"abc",',
+    'data: "result":{"ok":true}}',
+    "",
+  ].join("\n");
+  assertCheck("multi-line SSE data event parses", parseMcpResponse(multilineSse, "abc").result.ok === true);
+
+  let missingIdThrew = false;
+  try {
+    parseMcpResponse(interleavedSse, 999);
+  } catch (error) {
+    missingIdThrew = /JSON-RPC id 999/.test(error?.message ?? String(error));
+  }
+  assertCheck("missing expected JSON-RPC id fails closed", missingIdThrew);
+
+  assertCheck("hidden ChatGPT target is background-only", isBackgroundOnlySendTarget("chatgpt-app-hidden") === true);
+  assertCheck("legacy ChatGPT target is background-only", isBackgroundOnlySendTarget("chatgpt-app") === true);
+  assertCheck("automatic ChatGPT target reports visible fallback possibility", isBackgroundOnlySendTarget("chatgpt-app-auto") === false);
+  assertCheck("visible ChatGPT target is not background-only", isBackgroundOnlySendTarget("chatgpt-app-visible") === false);
+  assertCheck("JSON-RPC null id does not equal string null", jsonRpcIdEquals(null, "null") === false);
+
+  printJson({ ok: true, checks });
 }
 
 function assertJsonRpcOk(response, label) {
@@ -1329,7 +1429,7 @@ async function sendPromptWithChatGptAppResult(args) {
       ok: false,
       status: "failed",
       transport: args.sendTarget ?? DEFAULT_CHATGPT_SEND,
-      backgroundOnly: true,
+      backgroundOnly: isBackgroundOnlySendTarget(args.sendTarget ?? DEFAULT_CHATGPT_SEND),
       resultFilePath: args.resultFilePath,
       finalDeliveryText: readTextFileIfExists(args.resultFilePath),
       finalHide,
@@ -1340,6 +1440,10 @@ async function sendPromptWithChatGptAppResult(args) {
       },
     };
   }
+}
+
+function isBackgroundOnlySendTarget(sendTarget) {
+  return sendTarget === "chatgpt-app" || sendTarget === "chatgpt-app-hidden";
 }
 
 async function sendPromptWithChatGptApp({ prompt, timeoutMs, resultFilePath, expectText, sendTarget = DEFAULT_CHATGPT_SEND }) {
@@ -3278,6 +3382,7 @@ Usage:
   node scripts/devspace_manager.mjs harness [--roots /path/a,/path/b] [--port 7676] [--deep] [--write-test]
   node scripts/devspace_manager.mjs debug [--roots /path/a] "debug audit this repo"
   node scripts/devspace_manager.mjs task "deep debug audit this repo" [--roots /path/a] [--allow-edits] [--send chatgpt-app-auto|chatgpt-app-hidden|chatgpt-app-visible|none]
+  node scripts/devspace_manager.mjs self-test
   node scripts/devspace_manager.mjs status
   node scripts/devspace_manager.mjs doctor
   node scripts/devspace_manager.mjs stop

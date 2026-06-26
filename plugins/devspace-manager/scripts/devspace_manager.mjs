@@ -1434,9 +1434,12 @@ async function sendPromptWithChatGptAppResult(args) {
       finalDeliveryText: readTextFileIfExists(args.resultFilePath),
       finalHide,
       reason: error instanceof Error ? error.message : String(error),
+      chatGptDiagnostics: collectChatGptDiagnostics(),
       error: {
         name: error instanceof Error ? error.name : "Error",
+        code: error instanceof Error ? error.code ?? undefined : undefined,
         message: error instanceof Error ? error.message : String(error),
+        details: error instanceof Error ? error.chatGptDetails ?? undefined : undefined,
       },
       attempts: error instanceof Error ? error.chatGptAttempts ?? undefined : undefined,
     };
@@ -1988,6 +1991,7 @@ function sendPromptWithVisibleChatGpt(prompt) {
 }
 
 function sendPromptWithVisibleChatGptAx(prompt) {
+  assertMacSessionUnlocked("visible Accessibility automation");
   const launch = spawnSync("/usr/bin/open", ["-b", "com.openai.chat", "-u", "chatgpt://new-conversation"], {
     encoding: "utf8",
     timeout: 15_000,
@@ -2016,6 +2020,7 @@ function sendPromptWithVisibleChatGptAx(prompt) {
 }
 
 function sendPromptWithVisibleChatGptKeyboard(prompt) {
+  assertMacSessionUnlocked("visible keyboard automation");
   const launch = spawnSync("/usr/bin/open", ["-b", "com.openai.chat", "-u", "chatgpt://new-conversation"], {
     encoding: "utf8",
     timeout: 15_000,
@@ -2071,6 +2076,7 @@ function sendPromptWithVisibleChatGptKeyboard(prompt) {
 }
 
 function ensureVisibleChatGptWindow(label) {
+  assertMacSessionUnlocked(label);
   let state = waitForChatGptWindow(5_000);
   if (state?.windows > 0) return state;
 
@@ -2082,6 +2088,7 @@ function ensureVisibleChatGptWindow(label) {
 }
 
 function ensureVisibleChatGptCoreGraphicsWindow(label) {
+  assertMacSessionUnlocked(label);
   let state = waitForChatGptCoreGraphicsWindow(5_000);
   if (state?.ok && state.windows > 0) return state;
 
@@ -2116,6 +2123,64 @@ function waitForChatGptCoreGraphicsWindow(timeoutMs) {
 
 function chatGptCoreGraphicsWindowState() {
   return runChatGptSwiftJson(CHATGPT_CG_WINDOW_STATE_SWIFT, "CHATGPT_CG_WINDOW_STATE", 20_000);
+}
+
+function assertMacSessionUnlocked(label) {
+  const state = macSessionState();
+  if (state.ok && state.screenLocked) {
+    throw chatGptDiagnosticError(
+      "CHATGPT_SCREEN_LOCKED",
+      `Cannot run ${label} while the macOS console session is locked.`,
+      state
+    );
+  }
+}
+
+function collectChatGptDiagnostics() {
+  if (process.platform !== "darwin") return null;
+  return {
+    session: macSessionState(),
+    accessibility: safeDiagnostic(chatGptVisibilityState),
+    coreGraphics: safeDiagnostic(chatGptCoreGraphicsWindowState),
+    launchServicesFront: spawnSyncText("lsappinfo", ["front"]),
+    launchServicesChatGpt: spawnSyncText("lsappinfo", [
+      "info",
+      "-only",
+      "name,pid,applicationtype,allowedtobecomefrontmost,isready,hidden",
+      "-app",
+      "com.openai.chat",
+    ]),
+  };
+}
+
+function macSessionState() {
+  return runChatGptSwiftJson(MAC_SESSION_STATE_SWIFT, "MAC_SESSION_STATE", 10_000);
+}
+
+function safeDiagnostic(callback) {
+  try {
+    return callback();
+  } catch (error) {
+    return {
+      ok: false,
+      reason: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+function spawnSyncText(command, args) {
+  const result = spawnSync(command, args, {
+    encoding: "utf8",
+    timeout: 5_000,
+    maxBuffer: 1024 * 1024,
+  });
+  return {
+    ok: !result.error && result.status === 0,
+    status: result.status,
+    stdout: preview(result.stdout),
+    stderr: preview(result.stderr),
+    error: result.error?.message,
+  };
 }
 
 function runChatGptWindowRecovery() {
@@ -2177,10 +2242,18 @@ function attachChatGptAttempts(error, attempts) {
   return target;
 }
 
+function chatGptDiagnosticError(code, message, details = null) {
+  const error = new Error(`${code}: ${message}`);
+  error.code = code;
+  error.chatGptDetails = details;
+  return error;
+}
+
 function failedAttemptFromError(error) {
   return {
     ok: false,
     reason: error instanceof Error ? error.message : String(error),
+    details: error instanceof Error ? error.chatGptDetails ?? undefined : undefined,
     attempts: error instanceof Error ? error.chatGptAttempts ?? undefined : undefined,
   };
 }
@@ -2188,7 +2261,11 @@ function failedAttemptFromError(error) {
 function runChatGptCoreGraphicsKeyboard() {
   const parsed = runChatGptSwiftJson(CHATGPT_CG_KEYBOARD_SWIFT, "CHATGPT_CG_KEYBOARD", 30_000);
   if (!parsed.ok) {
-    throw new Error(`${parsed.code || "CHATGPT_CG_KEYBOARD_FAILED"}: ${parsed.message || "CoreGraphics ChatGPT keyboard automation failed."}`);
+    throw chatGptDiagnosticError(
+      parsed.code || "CHATGPT_CG_KEYBOARD_FAILED",
+      parsed.message || "CoreGraphics ChatGPT keyboard automation failed.",
+      parsed
+    );
   }
   return parsed.value;
 }
@@ -2217,6 +2294,33 @@ function runChatGptSwiftJson(script, label, timeoutMs) {
   }
   return parsed;
 }
+
+const MAC_SESSION_STATE_SWIFT = String.raw`
+import AppKit
+import CoreGraphics
+import Foundation
+
+func emit(_ value: [String: Any]) {
+  if let data = try? JSONSerialization.data(withJSONObject: value, options: []),
+     let text = String(data: data, encoding: .utf8) {
+    print(text)
+  } else {
+    print("{\"ok\":false,\"code\":\"MAC_SESSION_JSON_FAILED\",\"message\":\"Could not serialize macOS session state.\"}")
+  }
+}
+
+let session = CGSessionCopyCurrentDictionary() as? [String: Any] ?? [:]
+emit([
+  "ok": true,
+  "screenLocked": (session["CGSSessionScreenIsLocked"] as? Int ?? 0) != 0,
+  "onConsole": (session["kCGSSessionOnConsoleKey"] as? Int ?? 0) != 0,
+  "loginDone": (session["kCGSessionLoginDoneKey"] as? Int ?? 0) != 0,
+  "userName": session["kCGSSessionUserNameKey"] as? String ?? "",
+  "frontmostBundleId": NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "",
+  "frontmostProcessName": NSWorkspace.shared.frontmostApplication?.localizedName ?? "",
+  "screenLockedTime": session["CGSSessionScreenLockedTime"] ?? NSNull(),
+])
+`;
 
 const CHATGPT_CG_WINDOW_STATE_SWIFT = String.raw`
 import AppKit

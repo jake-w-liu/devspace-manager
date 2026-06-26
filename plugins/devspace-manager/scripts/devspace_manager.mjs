@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
+import { lookup, Resolver } from "node:dns/promises";
+import { request as httpRequest } from "node:http";
+import { request as httpsRequest } from "node:https";
 import {
   appendFileSync,
   chmodSync,
@@ -15,10 +18,13 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, relative, resolve, join } from "node:path";
-import { pathToFileURL } from "node:url";
 
 const DEFAULT_PORT = 7676;
 const DEFAULT_TASK_TIMEOUT_MS = 30 * 60 * 1000;
+const LOCAL_DISCOVERY_TIMEOUT_MS = 30_000;
+const PUBLIC_DISCOVERY_TIMEOUT_MS = 120_000;
+const QUICK_TUNNEL_URL_TIMEOUT_MS = 90_000;
+const PUBLIC_DNS_SERVERS = ["1.1.1.1", "8.8.8.8"];
 const CONFIG_DIR = join(homedir(), ".devspace");
 const CONFIG_PATH = join(CONFIG_DIR, "config.json");
 const AUTH_PATH = join(CONFIG_DIR, "auth.json");
@@ -26,9 +32,13 @@ const MANAGER_DIR = join(CONFIG_DIR, "manager");
 const STATUS_PATH = join(MANAGER_DIR, "status.json");
 const SMOKE_CLIENT_PATH = join(MANAGER_DIR, "mcp-smoke-client.json");
 const TASKS_DIR = join(MANAGER_DIR, "tasks");
+const EXCHANGE_DIR = join(MANAGER_DIR, "exchange");
+const LOCK_DIR = join(MANAGER_DIR, "lock");
+const LOCK_INFO_PATH = join(LOCK_DIR, "owner.json");
 const CLOUDFLARED_LOG = join(MANAGER_DIR, "cloudflared.log");
 const DEVSPACE_LOG = join(MANAGER_DIR, "devspace.log");
 const URL_RE = /https:\/\/[-a-z0-9]+\.trycloudflare\.com/i;
+const TASK_ALIAS_COMMANDS = new Set(["audit", "debug", "review", "fix", "analyze"]);
 const TEXT_PROBE_FILENAMES = [
   "AGENTS.md",
   "CLAUDE.md",
@@ -79,6 +89,14 @@ const SEARCH_EXCLUDED_DIRS = new Set([
 
 async function main() {
   const { command, options } = parseArgs(process.argv.slice(2));
+  if (requiresManagerLock(command)) {
+    await withManagerLock(() => runCommand(command, options));
+    return;
+  }
+  await runCommand(command, options);
+}
+
+async function runCommand(command, options) {
   switch (command) {
     case "start":
       await start(options);
@@ -99,12 +117,38 @@ async function main() {
     case "delegate":
       await task(options);
       return;
+    case "live-check":
+    case "chatgpt-check":
+      await chatGptLiveCheck(options);
+      return;
+    case "audit":
+    case "debug":
+    case "review":
+    case "fix":
+    case "analyze":
+      await task({
+        ...options,
+        send: options.send ?? "chatgpt-app",
+        prompt: options.prompt || `${command} this codebase through DevSpace MCP. Return verified findings only.`,
+      });
+      return;
     case "help":
       printHelp();
       return;
     default:
       throw new Error(`Unknown command: ${command}`);
   }
+}
+
+function requiresManagerLock(command) {
+  return command === "start" ||
+    command === "stop" ||
+    command === "harness" ||
+    command === "task" ||
+    command === "delegate" ||
+    command === "live-check" ||
+    command === "chatgpt-check" ||
+    TASK_ALIAS_COMMANDS.has(command);
 }
 
 function parseArgs(args) {
@@ -138,7 +182,7 @@ function parseArgs(args) {
         options.send = next;
         i += 1;
       } else {
-        options.send = "psst-gpt";
+        options.send = "chatgpt-app";
       }
     } else if (arg === "--timeout-ms") {
       options.timeoutMs = Number(requireOptionValue(args, ++i, arg));
@@ -169,6 +213,46 @@ function requireOptionValue(args, index, option) {
   return value;
 }
 
+async function withManagerLock(callback) {
+  acquireManagerLock();
+  try {
+    return await callback();
+  } finally {
+    releaseManagerLock();
+  }
+}
+
+function acquireManagerLock() {
+  mkdirSync(MANAGER_DIR, { recursive: true });
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      mkdirSync(LOCK_DIR, { mode: 0o700 });
+      writeJson(LOCK_INFO_PATH, {
+        pid: process.pid,
+        startedAt: new Date().toISOString(),
+        command: process.argv.slice(2),
+      }, 0o600);
+      return;
+    } catch (error) {
+      if (error?.code !== "EEXIST") {
+        throw permissionAwareError(error, `Unable to create DevSpace Manager lock at ${LOCK_DIR}.`);
+      }
+      const owner = readJson(LOCK_INFO_PATH, null);
+      if (Number.isInteger(owner?.pid) && isAlive(owner.pid)) {
+        throw new Error(`Another DevSpace Manager command is already running with pid ${owner.pid}. Wait for it to finish before starting a second start/stop/task/harness command.`);
+      }
+      safeRemovePath(LOCK_DIR, "stale manager lock");
+    }
+  }
+  throw new Error(`Unable to acquire DevSpace Manager lock at ${LOCK_DIR}.`);
+}
+
+function releaseManagerLock() {
+  const owner = readJson(LOCK_INFO_PATH, null);
+  if (owner?.pid && owner.pid !== process.pid) return;
+  safeRemovePath(LOCK_DIR, "manager lock");
+}
+
 async function harness(options) {
   const started = await start({ ...options, reuse: true, silent: true });
   const checks = await runChecks(started, {
@@ -193,8 +277,16 @@ async function harness(options) {
 }
 
 async function task(options) {
-  const started = await start({ ...options, reuse: true, silent: true });
+  const taskId = `devspace-task-${new Date().toISOString().replace(/[:.]/g, "-")}`;
+  const exchangeRoot = prepareExchangeRoot(taskId);
+  const started = await start({
+    ...options,
+    roots: appendRootOption(options.roots ?? process.cwd(), exchangeRoot),
+    reuse: true,
+    silent: true,
+  });
   const checks = await runChecks(started, { deep: true, writeTest: false });
+  checks.push(...await mcpSmokeChecks(started, { rootOverride: exchangeRoot, writeTest: true }));
   const ok = checks.every((check) => check.ok);
   if (!ok) {
     printJson({
@@ -210,16 +302,21 @@ async function task(options) {
   }
 
   const prompt = options.prompt || "Deep debug audit this codebase and return verified findings.";
-  const taskRoot = firstExistingRoot(started.allowedRoots);
+  const taskRoot = firstExistingRoot(started.allowedRoots.filter((root) => root !== exchangeRoot));
+  const resultFileName = "result.md";
+  const resultFilePath = join(exchangeRoot, resultFileName);
+  const doneToken = `DEVSPACE_MANAGER_TASK_DONE ${taskId}`;
   const chatGptPrompt = buildChatGptTaskPrompt({
     task: prompt,
     status: started,
     root: taskRoot,
+    exchangeRoot,
+    resultFileName,
+    doneToken,
     allowEdits: Boolean(options.allowEdits),
   });
   const outputDir = resolve(options.outputDir ?? TASKS_DIR);
   mkdirSync(outputDir, { recursive: true });
-  const taskId = `devspace-task-${new Date().toISOString().replace(/[:.]/g, "-")}`;
   const promptPath = join(outputDir, `${taskId}.prompt.md`);
   const resultPath = join(outputDir, `${taskId}.json`);
   writeFileSync(promptPath, chatGptPrompt, { mode: 0o600 });
@@ -227,24 +324,27 @@ async function task(options) {
 
   let sendResult = null;
   if (options.send && options.send !== "none") {
-    if (options.send !== "psst-gpt") {
+    if (options.send !== "chatgpt-app") {
       throw new Error(`Unsupported --send target: ${options.send}`);
     }
-    sendResult = await sendPromptWithPsstGpt({
+    sendResult = await sendPromptWithChatGptApp({
       prompt: chatGptPrompt,
-      root: taskRoot,
       timeoutMs: parseTimeoutMs(options.timeoutMs ?? DEFAULT_TASK_TIMEOUT_MS),
+      resultFilePath,
+      expectText: doneToken,
     });
   }
 
   const result = {
-    ok: true,
+    ok: sendResult ? Boolean(sendResult.ok) : true,
     prompt,
     publicMcpUrl: started.publicMcpUrl,
     localMcpUrl: started.localMcpUrl,
     allowedRoots: started.allowedRoots,
     chatGptPromptPath: promptPath,
     resultPath,
+    exchangeRoot,
+    chatGptResultPath: resultFilePath,
     ownerTokenCommand: "jq -r .ownerToken ~/.devspace/auth.json",
     checks,
     send: sendResult,
@@ -252,6 +352,92 @@ async function task(options) {
   };
   writeJson(resultPath, result, 0o600);
   printJson(result);
+  if (!result.ok) process.exitCode = 1;
+}
+
+async function chatGptLiveCheck(options) {
+  const taskId = `devspace-live-check-${new Date().toISOString().replace(/[:.]/g, "-")}`;
+  const exchangeRoot = prepareExchangeRoot(taskId);
+  const started = await start({
+    ...options,
+    roots: appendRootOption(options.roots ?? process.cwd(), exchangeRoot),
+    reuse: true,
+    silent: true,
+  });
+  const checks = await runChecks(started, { deep: true, writeTest: false });
+  checks.push(...await mcpSmokeChecks(started, { rootOverride: exchangeRoot, writeTest: true }));
+  const ok = checks.every((check) => check.ok);
+  if (!ok) {
+    printJson({
+      ok: false,
+      publicMcpUrl: started.publicMcpUrl,
+      localMcpUrl: started.localMcpUrl,
+      allowedRoots: started.allowedRoots,
+      checks,
+      reason: "DevSpace did not pass the live-check preflight checks.",
+    });
+    process.exitCode = 1;
+    return;
+  }
+
+  const root = firstExistingRoot(started.allowedRoots.filter((candidate) => candidate !== exchangeRoot));
+  const marker = `DEVSPACE_MANAGER_LIVE_OK_${Date.now()}_${randomBytes(6).toString("hex")}`;
+  const relativeMarkerPath = ".devspace-manager-live-check/marker.txt";
+  const markerPath = join(root, relativeMarkerPath);
+  mkdirSync(dirname(markerPath), { recursive: true });
+  writeFileSync(markerPath, `marker=${marker}\n`, { mode: 0o600 });
+  chmodSync(markerPath, 0o600);
+
+  const outputDir = resolve(options.outputDir ?? TASKS_DIR);
+  mkdirSync(outputDir, { recursive: true });
+  const resultPath = join(outputDir, `${taskId}.json`);
+  const promptPath = join(outputDir, `${taskId}.prompt.md`);
+  const resultFileName = "live-check-result.txt";
+  const resultFilePath = join(exchangeRoot, resultFileName);
+  const chatGptPrompt = buildChatGptLiveCheckPrompt({
+    status: started,
+    root,
+    exchangeRoot,
+    relativeMarkerPath,
+    resultFileName,
+  });
+  writeFileSync(promptPath, chatGptPrompt, { mode: 0o600 });
+  chmodSync(promptPath, 0o600);
+
+  let sendResult;
+  try {
+    sendResult = await sendPromptWithChatGptApp({
+      prompt: chatGptPrompt,
+      timeoutMs: parseTimeoutMs(options.timeoutMs ?? DEFAULT_TASK_TIMEOUT_MS),
+      resultFilePath,
+      expectText: marker,
+    });
+  } finally {
+    safeRemovePath(join(root, ".devspace-manager-live-check"), "live-check marker directory");
+  }
+
+  const responseText = String(sendResult?.finalDeliveryText ?? "");
+  const markerFound = responseText.includes(marker);
+  const result = {
+    ok: markerFound,
+    markerFound,
+    expectedMarker: marker,
+    publicMcpUrl: started.publicMcpUrl,
+    localMcpUrl: started.localMcpUrl,
+    allowedRoots: started.allowedRoots,
+    chatGptPromptPath: promptPath,
+    resultPath,
+    exchangeRoot,
+    chatGptResultPath: resultFilePath,
+    checks,
+    send: sendResult,
+    reason: markerFound
+      ? "ChatGPT wrote the marker to the DevSpace exchange file after reading it through the DevSpace connector."
+      : "ChatGPT did not write the live-check marker to the DevSpace exchange file. The ChatGPT app may not have accepted the hidden deep link, may not have the DevSpace connector configured, or did not use it.",
+  };
+  writeJson(resultPath, result, 0o600);
+  printJson(result);
+  if (!markerFound) process.exitCode = 1;
 }
 
 async function start(options) {
@@ -276,6 +462,7 @@ async function startOnce(options) {
   ensureCommand("devspace");
   if (!options.noTunnel && !options.publicBaseUrl) ensureCommand("cloudflared");
   mkdirSync(MANAGER_DIR, { recursive: true });
+  assertManagerWritable();
 
   let existing = loadStatus();
   if (options.reuse && canReuseStatus(existing, { port, roots, options })) {
@@ -313,9 +500,9 @@ async function startOnce(options) {
     },
   };
   writeJson(STATUS_PATH, status, 0o600);
-  await waitFor(async () => (await httpStatus(`http://127.0.0.1:${port}/.well-known/oauth-protected-resource/mcp`)) === 200, 30_000, "local OAuth discovery");
+  await waitFor(async () => (await httpStatus(`http://127.0.0.1:${port}/.well-known/oauth-protected-resource/mcp`)) === 200, LOCAL_DISCOVERY_TIMEOUT_MS, "local OAuth discovery");
   if (publicBaseUrl.startsWith("https://")) {
-    await waitFor(async () => (await httpStatus(`${publicBaseUrl}/.well-known/oauth-protected-resource/mcp`)) === 200, 60_000, "public OAuth discovery");
+    await waitFor(async () => (await httpStatus(`${publicBaseUrl}/.well-known/oauth-protected-resource/mcp`)) === 200, PUBLIC_DISCOVERY_TIMEOUT_MS, "public OAuth discovery");
   }
   if (!options.silent) {
     printJson({
@@ -334,7 +521,9 @@ async function startOnce(options) {
 
 function isRetryableTunnelError(error) {
   const message = error instanceof Error ? error.message : String(error);
-  return message.includes("Cloudflare tunnel URL") || message.includes("public OAuth discovery");
+  return message.includes("Cloudflare tunnel URL") ||
+    message.includes("Cloudflare tunnel hostname") ||
+    message.includes("public OAuth discovery");
 }
 
 function canReuseStatus(status, { port, roots, options }) {
@@ -354,12 +543,54 @@ function sameStringArray(left, right) {
     left.every((value, index) => value === right[index]);
 }
 
+function assertManagerWritable() {
+  const probePath = join(MANAGER_DIR, `.write-check-${process.pid}-${Date.now()}`);
+  try {
+    writeFileSync(probePath, "ok\n", { mode: 0o600 });
+    safeRemoveFile(probePath, "manager write probe");
+  } catch (error) {
+    throw permissionAwareError(error, `DevSpace Manager needs write access to ${MANAGER_DIR}. In Codex, approve the command that writes outside the workspace or run with a filesystem profile that permits ~/.devspace.`);
+  }
+}
+
+function safeRemoveFile(path, label) {
+  safeRemovePath(path, label);
+}
+
+function safeRemovePath(path, label) {
+  if (!existsSync(path)) return;
+  try {
+    rmSync(path, { recursive: true, force: true });
+    return;
+  } catch (firstError) {
+    try {
+      chmodSync(path, 0o600);
+      rmSync(path, { recursive: true, force: true });
+      return;
+    } catch (secondError) {
+      throw permissionAwareError(secondError, `Unable to remove ${label} at ${path}.`);
+    }
+  }
+}
+
+function permissionAwareError(error, prefix) {
+  if (error?.code === "EPERM" || error?.code === "EACCES") {
+    return new Error(`${prefix} Permission was denied by the OS or Codex sandbox (${error.code}).`);
+  }
+  return error;
+}
+
 async function stop({ print }) {
   const status = loadStatus();
   const killed = [];
   if (status?.devspacePid) killed.push(...killPidGroup(status.devspacePid, "devspace"));
   if (status?.cloudflaredPid) killed.push(...killPidGroup(status.cloudflaredPid, "cloudflared"));
-  if (existsSync(STATUS_PATH)) rmSync(STATUS_PATH, { force: true });
+  const pidFileCloudflaredPid = readCloudflaredPid();
+  if (pidFileCloudflaredPid && pidFileCloudflaredPid !== status?.cloudflaredPid) {
+    killed.push(...killPidGroup(pidFileCloudflaredPid, "cloudflared"));
+  }
+  safeRemoveFile(STATUS_PATH, "managed status file");
+  safeRemoveFile(join(MANAGER_DIR, "cloudflared.pid"), "managed cloudflared pid file");
   if (print) printJson({ ok: true, killed });
 }
 
@@ -489,7 +720,10 @@ async function runMcpSmoke(status, options = {}) {
     if (!tools.includes(tool)) throw new Error(`MCP tools/list did not include required tool: ${tool}`);
   }
 
-  const root = firstExistingRoot(status.allowedRoots);
+  const root = options.rootOverride ?? firstExistingRoot(status.allowedRoots);
+  if (!status.allowedRoots.includes(root)) {
+    throw new Error(`MCP smoke root is not in allowed roots: ${root}`);
+  }
   const openResponse = await callMcpTool({
     url: localMcpUrl,
     accessToken,
@@ -801,6 +1035,21 @@ function firstExistingRoot(roots) {
   return root;
 }
 
+function prepareExchangeRoot(taskId) {
+  const exchangeRoot = join(EXCHANGE_DIR, taskId);
+  safeRemovePath(exchangeRoot, "stale DevSpace exchange directory");
+  mkdirSync(exchangeRoot, { recursive: true, mode: 0o700 });
+  chmodSync(exchangeRoot, 0o700);
+  writeFileSync(join(exchangeRoot, "README.txt"), "DevSpace Manager result exchange root.\n", { mode: 0o600 });
+  return exchangeRoot;
+}
+
+function appendRootOption(rawRoots, extraRoot) {
+  const roots = parseRoots(rawRoots);
+  if (!roots.includes(extraRoot)) roots.push(extraRoot);
+  return roots.join(",");
+}
+
 function findTextProbeFile(root) {
   for (const filename of TEXT_PROBE_FILENAMES) {
     const candidate = join(root, filename);
@@ -851,7 +1100,7 @@ function isSmallTextProbe(path) {
   return TEXT_PROBE_EXTENSIONS.has(extension);
 }
 
-function buildChatGptTaskPrompt({ task, status, root, allowEdits }) {
+function buildChatGptTaskPrompt({ task, status, root, exchangeRoot, resultFileName, doneToken, allowEdits }) {
   const editInstruction = allowEdits
     ? "You may edit files through DevSpace when the fix is clear. Prefer targeted edit calls over full rewrites. After edits, run the relevant tests and summarize the exact files changed."
     : "Do not edit files unless I explicitly follow up asking you to do so. Return verified findings and concrete fix guidance; Codex will implement locally.";
@@ -863,6 +1112,8 @@ function buildChatGptTaskPrompt({ task, status, root, allowEdits }) {
     "Connector details:",
     `- MCP connector URL: ${status.publicMcpUrl}`,
     `- Workspace path to open: ${root}`,
+    `- Result exchange workspace path to open when finished: ${exchangeRoot}`,
+    `- Result file to write inside the result exchange workspace: ${resultFileName}`,
     `- Allowed roots: ${status.allowedRoots.join(", ")}`,
     "- If the connector is not already configured in ChatGPT, ask the user to add the MCP connector URL above and authorize with the Owner password from this local command: jq -r .ownerToken ~/.devspace/auth.json",
     "",
@@ -872,6 +1123,8 @@ function buildChatGptTaskPrompt({ task, status, root, allowEdits }) {
     "3. Use read, grep/glob/ls when available, and bash for builds, tests, package scripts, git inspection, and other read-only command-line inspection.",
     "4. Verify every finding against actual files or command output before stating it.",
     `5. ${editInstruction}`,
+    "6. When finished, open the result exchange workspace path above and write the final answer to the result file above through DevSpace. The last line of the file must be exactly:",
+    doneToken,
     "",
     "Task:",
     task,
@@ -885,44 +1138,446 @@ function buildChatGptTaskPrompt({ task, status, root, allowEdits }) {
   ].join("\n");
 }
 
-async function sendPromptWithPsstGpt({ prompt, root, timeoutMs }) {
-  const script = findPsstGptScript();
-  const { runPsstGPT } = await import(pathToFileURL(script).href);
-  const result = await runPsstGPT({
-    prompt,
-    root,
-    timeoutMs,
-    background: true,
-    newChat: true,
-    tags: ["devspace-manager"],
-  });
-  return {
-    ok: result.status === "complete",
-    status: result.status,
-    finalDeliveryText: result.finalDeliveryText,
-    relaySessionId: result.record?.relaySessionId,
-  };
+function buildChatGptLiveCheckPrompt({ status, root, exchangeRoot, relativeMarkerPath, resultFileName }) {
+  return [
+    "# DevSpace Live Connector Check",
+    "",
+    "You are ChatGPT with a DevSpace MCP connector. This is an end-to-end connector check.",
+    "",
+    "Connector details:",
+    `- MCP connector URL: ${status.publicMcpUrl}`,
+    `- Workspace path to open: ${root}`,
+    `- Result exchange workspace path to open after reading the marker: ${exchangeRoot}`,
+    `- Result file to write inside the result exchange workspace: ${resultFileName}`,
+    `- Marker file path to read after opening the workspace: ${relativeMarkerPath}`,
+    "- If the DevSpace connector is not configured, say exactly: DEVSPACE_MANAGER_CONNECTOR_NOT_CONFIGURED",
+    "",
+    "Required steps:",
+    "1. Use the DevSpace MCP connector, not uploaded files or pasted source.",
+    "2. Call open_workspace with the workspace path above.",
+    "3. Read the marker file path above through DevSpace.",
+    "4. Open the result exchange workspace path above.",
+    "5. Write exactly the marker line from that file, and nothing else, to the result file above through DevSpace.",
+    "",
+    "The marker value is intentionally not included in this prompt. You must read the file through DevSpace to know it.",
+  ].join("\n");
 }
 
-function findPsstGptScript() {
-  const candidates = [];
-  if (process.env.PSST_GPT_SCRIPT) candidates.push(process.env.PSST_GPT_SCRIPT);
-  candidates.push(join(homedir(), "gpt-relay", "PsstGPT-Codex-Plugin", "plugins", "psst-gpt", "scripts", "psst_gpt.mjs"));
+async function sendPromptWithChatGptApp({ prompt, timeoutMs, resultFilePath, expectText }) {
+  if (process.platform !== "darwin") {
+    throw new Error("ChatGPT app sending is only supported on macOS.");
+  }
+  if (!resultFilePath) {
+    throw new Error("ChatGPT app sending requires a DevSpace result file path to poll.");
+  }
+  safeRemoveFile(resultFilePath, "stale ChatGPT result file");
+  const sent = sendPromptWithHiddenChatGptAccessibility(prompt);
+  const started = Date.now();
+  let lastText = "";
 
-  const cacheRoot = join(homedir(), ".codex", "plugins", "cache", "psst-gpt", "psst-gpt");
-  if (existsSync(cacheRoot)) {
-    const direct = join(cacheRoot, "scripts", "psst_gpt.mjs");
-    candidates.push(direct);
-    for (const version of readdirSync(cacheRoot).sort().reverse()) {
-      candidates.push(join(cacheRoot, version, "scripts", "psst_gpt.mjs"));
+  while (Date.now() - started < timeoutMs) {
+    await sleep(2_000);
+    const text = readTextFileIfExists(resultFilePath);
+    if (expectText && text.includes(expectText)) {
+      return {
+        ok: true,
+        status: "complete",
+        transport: sent.transport,
+        delivery: sent,
+        resultFilePath,
+        finalDeliveryText: text,
+        matchedText: expectText,
+      };
+    }
+    if (text !== lastText) {
+      lastText = text;
     }
   }
 
-  const script = candidates.find((candidate) => candidate && existsSync(candidate));
-  if (!script) {
-    throw new Error("Could not find PsstGPT script. Set PSST_GPT_SCRIPT or install the psst-gpt plugin.");
+  return {
+    ok: false,
+    status: "timeout",
+    transport: sent.transport,
+    delivery: sent,
+    resultFilePath,
+    finalDeliveryText: lastText,
+    reason: expectText
+      ? "Timed out waiting for ChatGPT to write the expected text to the DevSpace result file."
+      : "Timed out waiting for ChatGPT to write a DevSpace result file.",
+  };
+}
+
+function sendPromptWithHiddenChatGptAccessibility(prompt) {
+  const launch = spawnSync("/usr/bin/open", ["-gj", "-b", "com.openai.chat"], {
+    encoding: "utf8",
+    timeout: 15_000,
+    maxBuffer: 1024 * 1024,
+  });
+  if (launch.error) {
+    throw new Error(`ChatGPT app launch failed: ${launch.error.message}`);
   }
-  return script;
+  if (launch.status !== 0) {
+    throw new Error(`ChatGPT app launch failed with exit ${launch.status}: ${preview(launch.stderr || launch.stdout)}`);
+  }
+  hideChatGptApp();
+  ensureChatGptHiddenWindow();
+  const delivery = runChatGptHiddenAx("sendPrompt", { prompt });
+  const hideState = hideChatGptApp();
+  return {
+    ok: true,
+    transport: "chatgpt-app-hidden-accessibility",
+    backgroundOnly: true,
+    delivery,
+    hideState,
+    promptBytes: Buffer.byteLength(prompt, "utf8"),
+    responseMode: "devspace-result-file",
+  };
+}
+
+function ensureChatGptHiddenWindow() {
+  let state = chatGptVisibilityState();
+  if (state.exists && state.windows > 0) return state;
+  const create = spawnSync("/usr/bin/open", ["-gj", "-b", "com.openai.chat", "-u", "chatgpt://new-conversation"], {
+    encoding: "utf8",
+    timeout: 15_000,
+    maxBuffer: 1024 * 1024,
+  });
+  if (create.error) throw new Error(`Unable to create hidden ChatGPT window: ${create.error.message}`);
+  if (create.status !== 0) {
+    throw new Error(`Unable to create hidden ChatGPT window: ${preview(create.stderr || create.stdout)}`);
+  }
+  const started = Date.now();
+  while (Date.now() - started < 12_000) {
+    hideChatGptApp();
+    state = chatGptVisibilityState();
+    if (state.exists && state.windows > 0 && state.visible === false) return state;
+    spawnSync("/bin/sleep", ["0.2"]);
+  }
+  throw new Error(`ChatGPT did not create a hidden window. Last state: ${JSON.stringify(state)}`);
+}
+
+function runChatGptHiddenAx(action, payload) {
+  const result = spawnSync("/usr/bin/osascript", [
+    "-l",
+    "JavaScript",
+    "-e",
+    CHATGPT_HIDDEN_AX_JXA,
+    JSON.stringify({ action, payload }),
+  ], {
+    encoding: "utf8",
+    timeout: 30_000,
+    maxBuffer: 10 * 1024 * 1024,
+  });
+  if (result.error) {
+    throw new Error(`ChatGPT hidden automation failed: ${result.error.message}`);
+  }
+  const raw = result.stdout.trim().split(/\r?\n/).filter(Boolean).at(-1) ?? "";
+  const parsed = readJsonFromString(raw, null);
+  if (!parsed) {
+    throw new Error(`ChatGPT hidden automation returned non-JSON output: ${preview(result.stdout || result.stderr)}`);
+  }
+  if (!parsed.ok) {
+    throw new Error(`${parsed.code || "CHATGPT_HIDDEN_AUTOMATION_FAILED"}: ${parsed.message || "ChatGPT hidden automation failed."}`);
+  }
+  return parsed.value;
+}
+
+const CHATGPT_HIDDEN_AX_JXA = String.raw`
+function run(argv) {
+  try {
+    var request = JSON.parse(argv[0] || "{}");
+    if (request.action !== "sendPrompt") fail("CHATGPT_UNKNOWN_ACTION", "Unknown ChatGPT action: " + request.action);
+    return JSON.stringify({ ok: true, value: sendPrompt(String((request.payload || {}).prompt || "")) });
+  } catch (error) {
+    return JSON.stringify({ ok: false, code: error.code || "CHATGPT_HIDDEN_AUTOMATION_FAILED", message: String(error.message || error) });
+  }
+}
+
+function sendPrompt(prompt) {
+  if (!prompt.trim()) fail("CHATGPT_EMPTY_PROMPT", "Refusing to send an empty ChatGPT prompt.");
+  var systemEvents = Application("System Events");
+  var proc = systemEvents.processes.byName("ChatGPT");
+  if (!proc.exists()) fail("CHATGPT_APP_NOT_RUNNING", "ChatGPT.app is not running.");
+  proc.visible = false;
+  dismissBlockingAlerts(proc);
+  var context = waitForComposer(proc, 12000);
+  setValue(context.composer.element, prompt);
+  delay(0.3);
+  var actual = String(readProperty(context.composer.element, "value") || "");
+  if (actual.trim() !== prompt.trim()) {
+    fail("CHATGPT_PROMPT_NOT_SET", "Could not set the hidden ChatGPT composer text.");
+  }
+  var button = findSendButton(context.window, context.composer);
+  if (!button) fail("CHATGPT_SEND_BUTTON_NOT_FOUND", "Could not find the hidden ChatGPT send button.");
+  press(button.element);
+  delay(0.5);
+  proc.visible = false;
+  return {
+    composerRole: context.composer.role,
+    sendButton: publicRecord(button),
+    state: processState(proc),
+  };
+}
+
+function waitForComposer(proc, timeoutMs) {
+  var deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    var windows = [];
+    try { windows = proc.windows(); } catch (_) {}
+    for (var i = 0; i < windows.length; i++) {
+      var composer = findComposer(windows[i]);
+      if (composer) return { window: windows[i], composer: composer };
+    }
+    delay(0.2);
+  }
+  fail("CHATGPT_COMPOSER_NOT_FOUND", "Could not find a hidden ChatGPT composer. Visible UI summary: " + debugUiSummary(proc));
+}
+
+function dismissBlockingAlerts(proc) {
+  var windows = [];
+  try { windows = proc.windows(); } catch (_) {}
+  for (var i = 0; i < windows.length; i++) {
+    var sheets = collectByRole(windows[i], 0, /Sheet|Dialog/i, []);
+    for (var j = 0; j < sheets.length; j++) {
+      var buttons = collectByRole(sheets[j].element, 0, /Button/i, []);
+      for (var k = 0; k < buttons.length; k++) {
+        var label = String(buttons[k].label || "");
+        if (/(^| )OK( |$)|(^| )Close( |$)|(^| )Dismiss( |$)/i.test(label)) {
+          press(buttons[k].element);
+          delay(0.2);
+          proc.visible = false;
+          return;
+        }
+      }
+    }
+  }
+}
+
+function findComposer(window) {
+  var records = collect(window, 0, []);
+  for (var i = 0; i < records.length; i++) {
+    var record = records[i];
+    if (!/TextArea|TextField|TextView/i.test(record.role || "")) continue;
+    if (record.enabled === false) continue;
+    return record;
+  }
+  return null;
+}
+
+function findSendButton(window, composer) {
+  var records = collect(window, 0, []);
+  var best = null;
+  var bestScore = -Infinity;
+  for (var i = 0; i < records.length; i++) {
+    var record = records[i];
+    if (!/Button/i.test(record.role || "")) continue;
+    if (record.enabled === false) continue;
+    if (!record.position || !record.size || !composer.position || !composer.size) continue;
+    if (/new chat|toggle sidebar|share|move to new window|close|minimize|full screen|model|gpt|5\.5/i.test(record.label || "")) continue;
+    var buttonCenterY = pointY(record.position) + sizeHeight(record.size) / 2;
+    var composerCenterY = pointY(composer.position) + sizeHeight(composer.size) / 2;
+    var score = 0;
+    if (pointX(record.position) > pointX(composer.position) + sizeWidth(composer.size) * 0.65) score += 400;
+    if (Math.abs(buttonCenterY - composerCenterY) < Math.max(48, sizeHeight(composer.size))) score += 300;
+    if (sizeWidth(record.size) >= 20 && sizeWidth(record.size) <= 80 && sizeHeight(record.size) >= 20 && sizeHeight(record.size) <= 80) score += 100;
+    score += pointX(record.position) / 1000;
+    if (score > bestScore) {
+      best = record;
+      bestScore = score;
+    }
+  }
+  return bestScore > 0 ? best : null;
+}
+
+function collect(element, depth, records) {
+  if (depth > 10) return records;
+  var record = elementRecord(element);
+  if (record) records.push(record);
+  var children = [];
+  try { children = element.uiElements(); } catch (_) {}
+  for (var i = 0; i < children.length; i++) collect(children[i], depth + 1, records);
+  return records;
+}
+
+function collectByRole(element, depth, pattern, records) {
+  if (depth > 10) return records;
+  var record = elementRecord(element);
+  if (record && pattern.test(record.role || "")) records.push(record);
+  var children = [];
+  try { children = element.uiElements(); } catch (_) {}
+  for (var i = 0; i < children.length; i++) collectByRole(children[i], depth + 1, pattern, records);
+  return records;
+}
+
+function debugUiSummary(proc) {
+  var windows = [];
+  try { windows = proc.windows(); } catch (_) {}
+  var summary = [];
+  for (var i = 0; i < windows.length && summary.length < 80; i++) {
+    var records = collect(windows[i], 0, []);
+    for (var j = 0; j < records.length && summary.length < 80; j++) {
+      summary.push({
+        role: records[j].role,
+        label: String(records[j].label || "").slice(0, 80),
+        position: records[j].position,
+        size: records[j].size,
+        enabled: records[j].enabled,
+      });
+    }
+  }
+  return JSON.stringify({ state: processState(proc), summary: summary });
+}
+
+function elementRecord(element) {
+  var role = String(readProperty(element, "role") || "");
+  var name = readProperty(element, "name");
+  var description = readProperty(element, "description");
+  var value = readProperty(element, "value");
+  var position = readProperty(element, "position");
+  var size = readProperty(element, "size");
+  var enabled = readProperty(element, "enabled");
+  var label = [String(description || ""), String(name || ""), String(value || "")].join(" ").replace(/\s+/g, " ").trim();
+  return { element: element, role: role, label: label, position: position, size: size, enabled: enabled };
+}
+
+function setValue(element, value) {
+  try {
+    element.value = value;
+    return;
+  } catch (_) {}
+  try {
+    element.value.set(value);
+    return;
+  } catch (_) {}
+  fail("CHATGPT_PROMPT_NOT_SET", "Could not set text on the hidden ChatGPT composer.");
+}
+
+function press(element) {
+  try {
+    element.actions.byName("AXPress").perform();
+    return;
+  } catch (_) {}
+  try {
+    element.click();
+    return;
+  } catch (_) {}
+  fail("CHATGPT_BUTTON_PRESS_FAILED", "Could not press the hidden ChatGPT send button.");
+}
+
+function readProperty(element, propertyName) {
+  try {
+    var value = element[propertyName];
+    if (typeof value === "function") return value.call(element);
+    return value;
+  } catch (_) {
+    return null;
+  }
+}
+
+function publicRecord(record) {
+  return { role: record.role, label: record.label, position: record.position, size: record.size, enabled: record.enabled };
+}
+
+function pointX(position) {
+  if (!position) return 0;
+  if (position.length !== undefined) return Number(position[0]) || 0;
+  return Number(position.x) || 0;
+}
+
+function pointY(position) {
+  if (!position) return 0;
+  if (position.length !== undefined) return Number(position[1]) || 0;
+  return Number(position.y) || 0;
+}
+
+function sizeWidth(size) {
+  if (!size) return 0;
+  if (size.length !== undefined) return Number(size[0]) || 0;
+  return Number(size.width) || 0;
+}
+
+function sizeHeight(size) {
+  if (!size) return 0;
+  if (size.length !== undefined) return Number(size[1]) || 0;
+  return Number(size.height) || 0;
+}
+
+function processState(proc) {
+  var windows = 0;
+  try { windows = proc.windows().length; } catch (_) {}
+  return { frontmost: proc.frontmost(), visible: proc.visible(), windows: windows };
+}
+
+function fail(code, message) {
+  var error = new Error(message);
+  error.code = code;
+  throw error;
+}
+`;
+
+function readTextFileIfExists(path) {
+  if (!existsSync(path)) return "";
+  try {
+    return readFileSync(path, "utf8");
+  } catch {
+    return "";
+  }
+}
+
+function hideChatGptApp() {
+  const hide = spawnSync("/usr/bin/osascript", [
+    "-e",
+    'tell application "System Events" to if exists process "ChatGPT" then set visible of process "ChatGPT" to false',
+  ], {
+    encoding: "utf8",
+    timeout: 10_000,
+    maxBuffer: 1024 * 1024,
+  });
+  if (hide.error) throw new Error(`Unable to hide ChatGPT after deep link: ${hide.error.message}`);
+  if (hide.status !== 0) {
+    throw new Error(`Unable to hide ChatGPT after deep link: ${preview(hide.stderr || hide.stdout)}`);
+  }
+  const state = chatGptVisibilityState();
+  if (state.exists && state.visible) {
+    throw new Error("ChatGPT remained visible after hidden deep-link delivery.");
+  }
+  return state;
+}
+
+function chatGptVisibilityState() {
+  const script = [
+    'tell application "System Events"',
+    '  if exists process "ChatGPT" then',
+    '    set isFrontmost to frontmost of process "ChatGPT"',
+    '    set isVisible to visible of process "ChatGPT"',
+    '    set windowCount to count of windows of process "ChatGPT"',
+    '    return "{\\"exists\\":true,\\"frontmost\\":" & isFrontmost & ",\\"visible\\":" & isVisible & ",\\"windows\\":" & windowCount & "}"',
+    '  else',
+    '    return "{\\"exists\\":false,\\"frontmost\\":null,\\"visible\\":null,\\"windows\\":0}"',
+    '  end if',
+    'end tell',
+  ].join("\n");
+  const result = spawnSync("/usr/bin/osascript", ["-e", script], {
+    encoding: "utf8",
+    timeout: 10_000,
+    maxBuffer: 1024 * 1024,
+  });
+  if (result.error || result.status !== 0) {
+    return {
+      exists: null,
+      frontmost: null,
+      visible: null,
+      windows: null,
+      error: result.error?.message || preview(result.stderr || result.stdout),
+    };
+  }
+  return readJsonFromString(result.stdout.trim(), {
+    exists: null,
+    frontmost: null,
+    visible: null,
+    windows: null,
+    raw: result.stdout.trim(),
+  });
 }
 
 function parseTimeoutMs(value) {
@@ -955,6 +1610,12 @@ async function httpCheck(name, url, expectedStatus) {
 }
 
 async function httpStatus(url) {
+  const fetchStatus = await httpStatusWithFetch(url);
+  if (fetchStatus !== null) return fetchStatus;
+  return httpStatusWithResolvedPublicDns(url);
+}
+
+async function httpStatusWithFetch(url) {
   try {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 10_000);
@@ -966,20 +1627,58 @@ async function httpStatus(url) {
   }
 }
 
+async function httpStatusWithResolvedPublicDns(url) {
+  const parsed = new URL(url);
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+  const addresses = await resolvePublicHostname(parsed.hostname);
+  const address = addresses[0];
+  if (!address) return null;
+  const requester = parsed.protocol === "https:" ? httpsRequest : httpRequest;
+  return new Promise((resolveStatus) => {
+    const request = requester({
+      protocol: parsed.protocol,
+      hostname: parsed.hostname,
+      port: parsed.port || (parsed.protocol === "https:" ? 443 : 80),
+      path: `${parsed.pathname}${parsed.search}`,
+      method: "GET",
+      timeout: 10_000,
+      lookup: (_hostname, _options, callback) => callback(null, address, 4),
+      headers: { "user-agent": "node" },
+    }, (response) => {
+      response.resume();
+      resolveStatus(response.statusCode ?? null);
+    });
+    request.on("timeout", () => {
+      request.destroy();
+      resolveStatus(null);
+    });
+    request.on("error", () => resolveStatus(null));
+    request.end();
+  });
+}
+
 function startCloudflared(port) {
   writeFileSync(CLOUDFLARED_LOG, "", { mode: 0o600 });
   const pid = startDetached("cloudflared", ["tunnel", "--url", `http://127.0.0.1:${port}`], CLOUDFLARED_LOG);
   writeFileSync(join(MANAGER_DIR, "cloudflared.pid"), String(pid), { mode: 0o600 });
-  return waitForCloudflaredUrl();
+  return waitForCloudflaredUrl().catch((error) => {
+    killPidGroup(pid, "cloudflared");
+    safeRemoveFile(join(MANAGER_DIR, "cloudflared.pid"), "managed cloudflared pid file");
+    throw error;
+  });
 }
 
 async function waitForCloudflaredUrl() {
   const started = Date.now();
-  while (Date.now() - started < 60_000) {
+  let seenUrl = null;
+  while (Date.now() - started < QUICK_TUNNEL_URL_TIMEOUT_MS) {
     if (existsSync(CLOUDFLARED_LOG)) {
       const log = readFileSync(CLOUDFLARED_LOG, "utf8");
       const match = log.match(URL_RE);
-      if (match) return normalizePublicBaseUrl(match[0]);
+      if (match) {
+        seenUrl = normalizePublicBaseUrl(match[0]);
+        if (await publicHostnameResolves(seenUrl)) return seenUrl;
+      }
       const fatal = cloudflaredFatalMessage(log);
       if (fatal) throw new Error(`Cloudflare tunnel URL failed: ${fatal}. See ${CLOUDFLARED_LOG}`);
       const pid = readCloudflaredPid();
@@ -989,7 +1688,29 @@ async function waitForCloudflaredUrl() {
     }
     await sleep(500);
   }
+  if (seenUrl) {
+    throw new Error(`Cloudflare tunnel hostname did not resolve in ${QUICK_TUNNEL_URL_TIMEOUT_MS}ms: ${new URL(seenUrl).hostname}. See ${CLOUDFLARED_LOG}`);
+  }
   throw new Error(`Timed out waiting for Cloudflare tunnel URL. See ${CLOUDFLARED_LOG}`);
+}
+
+async function publicHostnameResolves(baseUrl) {
+  return (await resolvePublicHostname(new URL(baseUrl).hostname)).length > 0;
+}
+
+async function resolvePublicHostname(hostname) {
+  try {
+    const systemResult = await lookup(hostname, { all: true, family: 4 });
+    const addresses = systemResult.map((entry) => entry.address).filter(Boolean);
+    if (addresses.length > 0) return addresses;
+  } catch {}
+  const resolver = new Resolver();
+  resolver.setServers(PUBLIC_DNS_SERVERS);
+  try {
+    return await resolver.resolve4(hostname);
+  } catch {
+    return [];
+  }
 }
 
 function cloudflaredFatalMessage(log) {
@@ -1062,6 +1783,14 @@ function readJson(path, fallback) {
   }
 }
 
+function readJsonFromString(value, fallback) {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return fallback;
+  }
+}
+
 function loadStatus() {
   return readJson(STATUS_PATH, null);
 }
@@ -1128,7 +1857,8 @@ function isAlive(pid) {
   try {
     process.kill(pid, 0);
     return true;
-  } catch {
+  } catch (error) {
+    if (error?.code === "EPERM") return true;
     return false;
   }
 }
@@ -1161,13 +1891,16 @@ function printHelp() {
 Usage:
   node scripts/devspace_manager.mjs start [--roots /path/a,/path/b] [--port 7676]
   node scripts/devspace_manager.mjs harness [--roots /path/a,/path/b] [--port 7676] [--deep] [--write-test]
-  node scripts/devspace_manager.mjs task "deep debug audit this repo" [--roots /path/a] [--allow-edits] [--send psst-gpt]
+  node scripts/devspace_manager.mjs debug [--roots /path/a] "debug audit this repo"
+  node scripts/devspace_manager.mjs task "deep debug audit this repo" [--roots /path/a] [--allow-edits] [--send chatgpt-app]
   node scripts/devspace_manager.mjs status
   node scripts/devspace_manager.mjs doctor
   node scripts/devspace_manager.mjs stop
 
 The task command starts and verifies DevSpace, writes a ChatGPT-ready delegated task prompt,
-and can optionally send that prompt through PsstGPT as the ChatGPT app control channel.
+and can optionally send that prompt through DevSpace Manager's built-in ChatGPT app control channel.
+The debug/audit/review/fix/analyze aliases use the task flow and default to --send chatgpt-app.
+Only one start/stop/task/harness command may run at a time.
 The Owner password is stored in ~/.devspace/auth.json.
 `);
 }

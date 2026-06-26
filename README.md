@@ -2,7 +2,7 @@
 
 Codex plugin and local harness for running [Waishnav/devspace](https://github.com/Waishnav/devspace) as a ChatGPT MCP connector.
 
-DevSpace Manager does not upload project archives to ChatGPT. It starts a local DevSpace MCP server, exposes it through an HTTPS tunnel, writes narrow allowed-root config, verifies the connector, and can generate a ChatGPT-ready delegated task prompt that tells ChatGPT to inspect the repo through DevSpace MCP.
+DevSpace Manager does not upload project archives to ChatGPT. It starts a local DevSpace MCP server, exposes it through an HTTPS tunnel, writes narrow allowed-root config, verifies the connector, and can send a ChatGPT-ready delegated task prompt that tells ChatGPT to inspect the repo through DevSpace MCP.
 
 ## What It Manages
 
@@ -14,7 +14,7 @@ DevSpace Manager does not upload project archives to ChatGPT. It starts a local 
 - Verifies OAuth discovery locally and over HTTPS.
 - Verifies `/mcp` returns `401` without OAuth, so the endpoint is not open.
 - Deep-tests OAuth token exchange and MCP calls against the allowed root.
-- Generates delegated task prompts for ChatGPT so Codex can outsource audits or fixes without zip upload/download.
+- Generates delegated task prompts for ChatGPT, sends them through its own strict-background hidden ChatGPT app sender when ChatGPT exposes an existing hidden-capable window, and waits for ChatGPT to write results back through a DevSpace exchange root so Codex can outsource audits or fixes without zip upload/download.
 
 ## Install In Codex
 
@@ -33,6 +33,7 @@ From the plugin directory:
 ```bash
 node scripts/devspace_manager.mjs harness --roots "$PWD"
 node scripts/devspace_manager.mjs harness --roots "$PWD" --deep --write-test
+node scripts/devspace_manager.mjs debug --roots "$PWD" "debug audit this repo"
 node scripts/devspace_manager.mjs task --roots "$PWD" "deep debug audit this repo; return verified findings only"
 node scripts/devspace_manager.mjs status
 node scripts/devspace_manager.mjs stop
@@ -73,18 +74,27 @@ Use `task` when Codex should hand work to ChatGPT while DevSpace provides file a
 node scripts/devspace_manager.mjs task --roots "$PWD" "deep debug audit the codebase"
 ```
 
+For audit/debug/review/fix style commands, use the direct aliases. These default to sending the generated prompt through DevSpace Manager's built-in strict-background ChatGPT app sender:
+
+```bash
+node scripts/devspace_manager.mjs debug --roots "$PWD" "deep debug audit the codebase"
+```
+
 The command starts/verifies DevSpace, then writes:
 
 - a ChatGPT instruction prompt under `~/.devspace/manager/tasks/*.prompt.md`
 - a JSON result file under `~/.devspace/manager/tasks/*.json`
+- a per-task result exchange root under `~/.devspace/manager/exchange/<task>/`
 
-If the ChatGPT desktop-app control channel is available through PsstGPT, the manager can send the prompt automatically:
+To be explicit about the internal ChatGPT app sender:
 
 ```bash
-node scripts/devspace_manager.mjs task --roots "$PWD" --send psst-gpt "deep debug audit the codebase"
+node scripts/devspace_manager.mjs task --roots "$PWD" --send chatgpt-app "deep debug audit the codebase"
 ```
 
-That sends only instructions. ChatGPT still reads, writes, and runs commands through the DevSpace MCP connector.
+That sends only instructions through the ChatGPT app. ChatGPT still reads, writes, and runs commands through the DevSpace MCP connector, and task completion is verified by the result file ChatGPT writes back through DevSpace.
+
+The strict-background sender does not activate or show ChatGPT. If ChatGPT has no accessible window, the command fails closed with a diagnostic instead of popping a window.
 
 ## Security Notes
 

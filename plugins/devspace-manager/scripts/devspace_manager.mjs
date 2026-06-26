@@ -1821,6 +1821,7 @@ function startDetached(command, args, logPath, env = process.env) {
       env,
       stdio: ["ignore", stdoutFd, stderrFd],
     });
+    child.on("error", () => {});
   } finally {
     closeSync(stdoutFd);
     closeSync(stderrFd);
@@ -1828,7 +1829,6 @@ function startDetached(command, args, logPath, env = process.env) {
   if (!Number.isInteger(child.pid) || child.pid <= 0) {
     throw new Error(`Failed to start ${command}; no child pid was returned.`);
   }
-  child.on("error", () => {});
   child.unref();
   return child.pid;
 }

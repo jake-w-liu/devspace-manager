@@ -1197,6 +1197,8 @@ function selfTest() {
   ].join("\n");
   assertCheck("SSE response selects expected JSON-RPC id", parseMcpResponse(interleavedSse, "7").result.ok === true);
   assertCheck("SSE response without expected id returns latest event", parseMcpResponse(interleavedSse).id === 8);
+  assertJsonRpcOk({ status: 200, json: { jsonrpc: "2.0", id: 11, result: null } }, "null result");
+  assertCheck("JSON-RPC null result is accepted", true);
 
   const multilineSse = [
     "event: message",
@@ -1231,7 +1233,7 @@ function assertJsonRpcOk(response, label) {
   if (response.json?.error) {
     throw new Error(`${label} returned JSON-RPC error: ${JSON.stringify(response.json.error)}`);
   }
-  if (!response.json?.result && response.json !== null) {
+  if (response.json !== null && !Object.hasOwn(response.json ?? {}, "result")) {
     throw new Error(`${label} returned no JSON-RPC result.`);
   }
 }
@@ -1457,6 +1459,7 @@ async function sendPromptWithChatGptApp({ prompt, timeoutMs, resultFilePath, exp
   if (!resultFilePath) {
     throw new Error("ChatGPT app sending requires a DevSpace result file path to poll.");
   }
+  assertMacSessionUnlocked("ChatGPT app sending");
   safeRemoveFile(resultFilePath, "stale ChatGPT result file");
   const sent = sendPromptWithChatGptTransport(prompt, sendTarget);
   const started = Date.now();

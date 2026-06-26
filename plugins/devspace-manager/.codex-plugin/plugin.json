@@ -1,6 +1,6 @@
 {
   "name": "devspace-manager",
-  "version": "0.1.0+codex.20260626175419",
+  "version": "0.1.0+codex.20260626175910",
   "description": "Start, verify, and delegate coding tasks through a local DevSpace MCP bridge for ChatGPT coding sessions.",
   "author": {
     "name": "Local developer"

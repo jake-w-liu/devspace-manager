@@ -26,6 +26,7 @@ const DEFAULT_TASK_TIMEOUT_MS = 30 * 60 * 1000;
 const LOCAL_DISCOVERY_TIMEOUT_MS = 30_000;
 const PUBLIC_DISCOVERY_TIMEOUT_MS = 120_000;
 const QUICK_TUNNEL_URL_TIMEOUT_MS = 90_000;
+const DEFAULT_HTTP_TIMEOUT_MS = 30_000;
 const PUBLIC_DNS_SERVERS = ["1.1.1.1", "8.8.8.8"];
 const CONFIG_DIR = join(homedir(), ".devspace");
 const CONFIG_PATH = join(CONFIG_DIR, "config.json");
@@ -464,6 +465,9 @@ async function start(options) {
 async function startOnce(options, lifecycle = { changedRuntimeState: false }) {
   const port = parsePort(options.port ?? DEFAULT_PORT);
   const roots = parseRoots(options.roots ?? process.cwd());
+  if (options.noTunnel && options.publicBaseUrl) {
+    throw new Error("--no-tunnel and --public-base-url are mutually exclusive.");
+  }
   const requestedPublicBaseUrl = options.publicBaseUrl
     ? normalizePublicBaseUrl(options.publicBaseUrl)
     : null;
@@ -904,12 +908,12 @@ async function exchangeSmokeToken({ status, localBase, ownerToken, client }) {
     resource,
     owner_token: ownerToken,
   });
-  const authorize = await fetch(`${localBase}/authorize`, {
+  const authorize = await fetchWithTimeout(`${localBase}/authorize`, {
     method: "POST",
     redirect: "manual",
     headers: { "content-type": "application/x-www-form-urlencoded" },
     body: authorizeBody,
-  });
+  }, "OAuth authorization");
   const location = authorize.headers.get("location");
   if (authorize.status !== 302 || !location) {
     const text = await authorize.text();
@@ -941,7 +945,7 @@ async function exchangeSmokeToken({ status, localBase, ownerToken, client }) {
 }
 
 async function fetchJson(url, { expectedStatus, label, ...options }) {
-  const response = await fetch(url, options);
+  const response = await fetchWithTimeout(url, options, label);
   const text = await response.text();
   let value = null;
   if (text) {
@@ -965,11 +969,11 @@ async function mcpRpc({ url, accessToken, sessionId, payload, allowEmpty = false
     accept: "application/json, text/event-stream",
   };
   if (sessionId) headers["mcp-session-id"] = sessionId;
-  const response = await fetch(url, {
+  const response = await fetchWithTimeout(url, {
     method: "POST",
     headers,
     body: JSON.stringify(payload),
-  });
+  }, `MCP ${payload?.method ?? "request"}`);
   const text = await response.text();
   if (!text && allowEmpty) {
     return { status: response.status, sessionId: response.headers.get("mcp-session-id") ?? sessionId, json: null };
@@ -1895,10 +1899,37 @@ function normalizePublicBaseUrl(value) {
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
     throw new Error(`--public-base-url must use http:// or https://, got: ${parsed.protocol}`);
   }
+  if (parsed.protocol === "http:" && !isLoopbackHostname(parsed.hostname)) {
+    throw new Error("--public-base-url must use https:// unless it points at localhost or 127.0.0.1.");
+  }
   parsed.hash = "";
   parsed.search = "";
   parsed.pathname = parsed.pathname.replace(/\/mcp\/?$/, "").replace(/\/+$/, "");
   return parsed.toString().replace(/\/$/, "");
+}
+
+function isLoopbackHostname(hostname) {
+  const normalized = hostname.toLowerCase();
+  return normalized === "localhost" ||
+    normalized === "127.0.0.1" ||
+    normalized === "::1" ||
+    normalized === "[::1]" ||
+    normalized.endsWith(".localhost");
+}
+
+async function fetchWithTimeout(url, options = {}, label = "HTTP request", timeoutMs = DEFAULT_HTTP_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } catch (error) {
+    if (controller.signal.aborted) {
+      throw new Error(`${label} timed out after ${timeoutMs}ms.`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function assertPortFree(port) {

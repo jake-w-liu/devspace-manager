@@ -1,0 +1,21 @@
+{
+  "name": "devspace-manager",
+  "version": "0.1.0",
+  "description": "Start, stop, and verify a local DevSpace MCP bridge for ChatGPT coding sessions.",
+  "author": {
+    "name": "Local developer"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "DevSpace Manager",
+    "shortDescription": "Manage a DevSpace MCP server and HTTPS tunnel.",
+    "longDescription": "DevSpace Manager installs a repeatable Codex workflow for launching, stopping, and verifying a local DevSpace MCP server exposed through a controlled HTTPS tunnel for ChatGPT connector use.",
+    "developerName": "Local developer",
+    "category": "Productivity",
+    "capabilities": [
+      "mcp",
+      "automation"
+    ],
+    "defaultPrompt": "Start DevSpace for this workspace and verify the connector URL."
+  }
+}

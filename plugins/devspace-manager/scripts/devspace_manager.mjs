@@ -8,6 +8,7 @@ import {
   appendFileSync,
   chmodSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -578,10 +579,11 @@ function safeRemovePath(path, label) {
 function makePathTreeRemovable(path) {
   let info;
   try {
-    info = statSync(path);
+    info = lstatSync(path);
   } catch {
     return;
   }
+  if (info.isSymbolicLink()) return;
   if (info.isDirectory()) {
     try {
       chmodSync(path, 0o700);

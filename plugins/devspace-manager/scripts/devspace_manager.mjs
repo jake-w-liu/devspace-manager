@@ -1270,7 +1270,8 @@ async function sendPromptWithChatGptApp({ prompt, timeoutMs, resultFilePath, exp
   while (Date.now() - started < timeoutMs) {
     await sleep(2_000);
     const text = readTextFileIfExists(resultFilePath);
-    if (expectText && text.includes(expectText)) {
+    const matched = expectText ? text.includes(expectText) : Boolean(text.trim());
+    if (matched) {
       return {
         ok: true,
         status: "complete",
@@ -1278,7 +1279,7 @@ async function sendPromptWithChatGptApp({ prompt, timeoutMs, resultFilePath, exp
         delivery: sent,
         resultFilePath,
         finalDeliveryText: text,
-        matchedText: expectText,
+        matchedText: expectText ?? null,
       };
     }
     if (text !== lastText) {

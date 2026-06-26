@@ -1349,7 +1349,10 @@ function runChatGptHiddenAx(action, payload) {
     maxBuffer: 10 * 1024 * 1024,
   });
   if (result.error) {
-    throw new Error(`ChatGPT hidden automation failed: ${result.error.message}`);
+    if (result.error.code === "ETIMEDOUT") {
+      throw new Error("CHATGPT_HIDDEN_AUTOMATION_TIMEOUT: Hidden ChatGPT accessibility automation timed out before it could find and submit through a hidden composer.");
+    }
+    throw new Error(`CHATGPT_HIDDEN_AUTOMATION_FAILED: ${result.error.message}`);
   }
   const raw = result.stdout.trim().split(/\r?\n/).filter(Boolean).at(-1) ?? "";
   const parsed = readJsonFromString(raw, null);

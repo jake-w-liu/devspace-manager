@@ -11,6 +11,7 @@ import {
   existsSync,
   lstatSync,
   mkdirSync,
+  mkdtempSync,
   openSync,
   readFileSync,
   readdirSync,
@@ -385,9 +386,10 @@ async function chatGptLiveCheck(options) {
 
   const root = firstExistingRoot(started.allowedRoots.filter((candidate) => candidate !== exchangeRoot));
   const marker = `DEVSPACE_MANAGER_LIVE_OK_${Date.now()}_${randomBytes(6).toString("hex")}`;
-  const relativeMarkerPath = ".devspace-manager-live-check/marker.txt";
-  const markerPath = join(root, relativeMarkerPath);
-  mkdirSync(dirname(markerPath), { recursive: true });
+  const markerDir = mkdtempSync(join(root, ".devspace-manager-live-check-"));
+  chmodSync(markerDir, 0o700);
+  const markerPath = join(markerDir, "marker.txt");
+  const relativeMarkerPath = relative(root, markerPath);
   writeFileSync(markerPath, `marker=${marker}\n`, { mode: 0o600 });
   chmodSync(markerPath, 0o600);
 
@@ -416,7 +418,7 @@ async function chatGptLiveCheck(options) {
       expectText: marker,
     });
   } finally {
-    safeRemovePath(join(root, ".devspace-manager-live-check"), "live-check marker directory");
+    safeRemovePath(markerDir, "live-check marker directory");
   }
 
   const responseText = String(sendResult?.finalDeliveryText ?? "");
@@ -809,11 +811,14 @@ async function runMcpSmoke(status, options = {}) {
 
   let writeEditOk = false;
   let writePath = null;
+  let writeDir = null;
   if (options.writeTest) {
     if (!toolNames.write || !toolNames.edit) {
       throw new Error("MCP write-test requested, but write/edit tools are not available.");
     }
-    writePath = `.devspace-manager-smoke/smoke-${Date.now()}.txt`;
+    writeDir = mkdtempSync(join(root, ".devspace-manager-smoke-"));
+    chmodSync(writeDir, 0o700);
+    writePath = relative(root, join(writeDir, `smoke-${Date.now()}.txt`));
     try {
       await callMcpTool({
         url: localMcpUrl,
@@ -847,7 +852,7 @@ async function runMcpSmoke(status, options = {}) {
       writeEditOk = rereadText.includes("one") && rereadText.includes("two");
       if (!writeEditOk) throw new Error("MCP write/edit smoke file did not contain expected edited content.");
     } finally {
-      rmSync(join(root, ".devspace-manager-smoke"), { recursive: true, force: true });
+      if (writeDir) safeRemovePath(writeDir, "MCP write/edit smoke directory");
     }
   }
 
@@ -1291,7 +1296,10 @@ function sendPromptWithHiddenChatGptAccessibility(prompt) {
   if (launch.status !== 0) {
     throw new Error(`ChatGPT app launch failed with exit ${launch.status}: ${preview(launch.stderr || launch.stdout)}`);
   }
-  hideChatGptApp();
+  const initialHide = hideChatGptAppQuietly();
+  if (!initialHide.ok) {
+    throw new Error(`ChatGPT remained visible after hidden launch: ${initialHide.reason}`);
+  }
   ensureChatGptHiddenWindow();
   let delivery;
   let finalHide;
@@ -1316,7 +1324,12 @@ function sendPromptWithHiddenChatGptAccessibility(prompt) {
 
 function ensureChatGptHiddenWindow() {
   let state = chatGptVisibilityState();
-  if (state.exists && state.windows > 0) return state;
+  if (state.exists && state.windows > 0) {
+    if (state.visible === false) return state;
+    const hidden = hideChatGptAppQuietly();
+    if (hidden.ok && hidden.state?.windows > 0 && hidden.state?.visible === false) return hidden.state;
+    throw new Error(`ChatGPT did not expose an existing hidden window. Last state: ${JSON.stringify(hidden.state ?? state)}`);
+  }
   const create = spawnSync("/usr/bin/open", ["-gj", "-b", "com.openai.chat", "-u", "chatgpt://new-conversation"], {
     encoding: "utf8",
     timeout: 15_000,
@@ -1328,9 +1341,9 @@ function ensureChatGptHiddenWindow() {
   }
   const started = Date.now();
   while (Date.now() - started < 12_000) {
-    hideChatGptApp();
-    state = chatGptVisibilityState();
-    if (state.exists && state.windows > 0 && state.visible === false) return state;
+    const hidden = hideChatGptAppQuietly();
+    state = hidden.state ?? chatGptVisibilityState();
+    if (hidden.ok && state.exists && state.windows > 0 && state.visible === false) return state;
     spawnSync("/bin/sleep", ["0.2"]);
   }
   throw new Error(`ChatGPT did not create a hidden window. Last state: ${JSON.stringify(state)}`);

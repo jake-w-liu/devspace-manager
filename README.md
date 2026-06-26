@@ -14,7 +14,8 @@ DevSpace Manager does not upload project archives to ChatGPT. It starts a local 
 - Verifies OAuth discovery locally and over HTTPS.
 - Verifies `/mcp` returns `401` without OAuth, so the endpoint is not open.
 - Deep-tests OAuth token exchange and MCP calls against the allowed root.
-- Generates delegated task prompts for ChatGPT, sends them through its own strict-background hidden ChatGPT app sender when ChatGPT exposes an existing hidden-capable window, and waits for ChatGPT to write results back through a DevSpace exchange root so Codex can outsource audits or fixes without zip upload/download.
+- Generates delegated task prompts for ChatGPT, sends them through its own ChatGPT app sender, and waits for ChatGPT to write results back through a DevSpace exchange root so Codex can outsource audits or fixes without zip upload/download.
+- Uses automatic ChatGPT delivery by default: hidden Accessibility first, visible Accessibility next, visible keyboard paste last, then hides ChatGPT again after visible submission.
 
 ## Install In Codex
 
@@ -69,8 +70,8 @@ Keep that password private.
 ## Delegate Work To ChatGPT
 
 Use `task` when Codex should hand work to ChatGPT while DevSpace provides file access. `task`,
-`delegate`, and the audit/debug/review/fix aliases send through the built-in strict-background
-ChatGPT app sender by default:
+`delegate`, and the audit/debug/review/fix aliases send through the built-in automatic ChatGPT
+app sender by default:
 
 ```bash
 node scripts/devspace_manager.mjs task --roots "$PWD" "deep debug audit the codebase"
@@ -88,18 +89,23 @@ The command starts/verifies DevSpace, then writes:
 - a JSON result file under `~/.devspace/manager/tasks/*.json`
 - a per-task result exchange root under `~/.devspace/manager/exchange/<task>/`
 
-To be explicit about the internal ChatGPT app sender:
+To be explicit about the automatic internal ChatGPT app sender:
 
 ```bash
-node scripts/devspace_manager.mjs task --roots "$PWD" --send chatgpt-app "deep debug audit the codebase"
+node scripts/devspace_manager.mjs task --roots "$PWD" --send chatgpt-app-auto "deep debug audit the codebase"
 ```
+
+`chatgpt-app-auto` tries hidden Accessibility first. If ChatGPT does not expose a hidden composer,
+it falls back to visible Accessibility automation and then visible keyboard paste. Visible fallback
+is transient: after submitting, the manager hides ChatGPT again. Use `--send chatgpt-app-hidden` to
+require hidden-only behavior, or `--send chatgpt-app-visible` to force visible automation.
 
 Use `--send none` only when you want DevSpace Manager to prepare the prompt/result metadata without
 contacting ChatGPT.
 
 That sends only instructions through the ChatGPT app. ChatGPT still reads, writes, and runs commands through the DevSpace MCP connector, and task completion is verified by the result file ChatGPT writes back through DevSpace.
 
-The strict-background sender does not activate or show ChatGPT. If ChatGPT has no accessible window, the command fails closed with a diagnostic instead of popping a window.
+If all ChatGPT app delivery methods fail, the command fails closed with a diagnostic and preserves the prompt/result paths for inspection.
 
 ## Security Notes
 

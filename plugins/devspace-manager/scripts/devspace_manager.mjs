@@ -43,6 +43,13 @@ const CLOUDFLARED_LOG = join(MANAGER_DIR, "cloudflared.log");
 const DEVSPACE_LOG = join(MANAGER_DIR, "devspace.log");
 const URL_RE = /https:\/\/[-a-z0-9]+\.trycloudflare\.com/i;
 const TASK_ALIAS_COMMANDS = new Set(["audit", "debug", "review", "fix", "analyze"]);
+const DEFAULT_CHATGPT_SEND = "chatgpt-app-auto";
+const CHATGPT_SEND_TARGETS = new Set([
+  "chatgpt-app",
+  "chatgpt-app-auto",
+  "chatgpt-app-hidden",
+  "chatgpt-app-visible",
+]);
 const TEXT_PROBE_FILENAMES = [
   "AGENTS.md",
   "CLAUDE.md",
@@ -119,7 +126,7 @@ async function runCommand(command, options) {
       return;
     case "task":
     case "delegate":
-      await task({ ...options, send: options.send ?? "chatgpt-app" });
+      await task({ ...options, send: options.send ?? DEFAULT_CHATGPT_SEND });
       return;
     case "live-check":
     case "chatgpt-check":
@@ -132,7 +139,7 @@ async function runCommand(command, options) {
     case "analyze":
       await task({
         ...options,
-        send: options.send ?? "chatgpt-app",
+        send: options.send ?? DEFAULT_CHATGPT_SEND,
         prompt: options.prompt || `${command} this codebase through DevSpace MCP. Return verified findings only.`,
       });
       return;
@@ -186,7 +193,7 @@ function parseArgs(args) {
         options.send = next;
         i += 1;
       } else {
-        options.send = "chatgpt-app";
+        options.send = DEFAULT_CHATGPT_SEND;
       }
     } else if (arg === "--timeout-ms") {
       options.timeoutMs = Number(requireOptionValue(args, ++i, arg));
@@ -328,7 +335,7 @@ async function task(options) {
 
   let sendResult = null;
   if (options.send && options.send !== "none") {
-    if (options.send !== "chatgpt-app") {
+    if (!CHATGPT_SEND_TARGETS.has(options.send)) {
       throw new Error(`Unsupported --send target: ${options.send}`);
     }
     sendResult = await sendPromptWithChatGptAppResult({
@@ -336,6 +343,7 @@ async function task(options) {
       timeoutMs: parseTimeoutMs(options.timeoutMs ?? DEFAULT_TASK_TIMEOUT_MS),
       resultFilePath,
       expectText: doneToken,
+      sendTarget: options.send,
     });
   }
 
@@ -416,6 +424,7 @@ async function chatGptLiveCheck(options) {
       timeoutMs: parseTimeoutMs(options.timeoutMs ?? DEFAULT_TASK_TIMEOUT_MS),
       resultFilePath,
       expectText: marker,
+      sendTarget: options.send ?? DEFAULT_CHATGPT_SEND,
     });
   } finally {
     safeRemovePath(markerDir, "live-check marker directory");
@@ -1242,7 +1251,7 @@ async function sendPromptWithChatGptAppResult(args) {
     return {
       ok: false,
       status: "failed",
-      transport: "chatgpt-app-hidden-accessibility",
+      transport: args.sendTarget ?? DEFAULT_CHATGPT_SEND,
       backgroundOnly: true,
       resultFilePath: args.resultFilePath,
       finalDeliveryText: readTextFileIfExists(args.resultFilePath),
@@ -1256,7 +1265,7 @@ async function sendPromptWithChatGptAppResult(args) {
   }
 }
 
-async function sendPromptWithChatGptApp({ prompt, timeoutMs, resultFilePath, expectText }) {
+async function sendPromptWithChatGptApp({ prompt, timeoutMs, resultFilePath, expectText, sendTarget = DEFAULT_CHATGPT_SEND }) {
   if (process.platform !== "darwin") {
     throw new Error("ChatGPT app sending is only supported on macOS.");
   }
@@ -1264,7 +1273,7 @@ async function sendPromptWithChatGptApp({ prompt, timeoutMs, resultFilePath, exp
     throw new Error("ChatGPT app sending requires a DevSpace result file path to poll.");
   }
   safeRemoveFile(resultFilePath, "stale ChatGPT result file");
-  const sent = sendPromptWithHiddenChatGptAccessibility(prompt);
+  const sent = sendPromptWithChatGptTransport(prompt, sendTarget);
   const started = Date.now();
   let lastText = "";
 
@@ -1299,6 +1308,29 @@ async function sendPromptWithChatGptApp({ prompt, timeoutMs, resultFilePath, exp
       ? "Timed out waiting for ChatGPT to write the expected text to the DevSpace result file."
       : "Timed out waiting for ChatGPT to write a DevSpace result file.",
   };
+}
+
+function sendPromptWithChatGptTransport(prompt, sendTarget) {
+  if (sendTarget === "chatgpt-app-visible") return sendPromptWithVisibleChatGpt(prompt);
+  if (sendTarget === "chatgpt-app-hidden" || sendTarget === "chatgpt-app") {
+    return sendPromptWithHiddenChatGptAccessibility(prompt);
+  }
+  if (sendTarget !== DEFAULT_CHATGPT_SEND) {
+    throw new Error(`Unsupported ChatGPT send target: ${sendTarget}`);
+  }
+  try {
+    return sendPromptWithHiddenChatGptAccessibility(prompt);
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    const fallback = sendPromptWithVisibleChatGpt(prompt);
+    return {
+      ...fallback,
+      hiddenAttempt: {
+        ok: false,
+        reason,
+      },
+    };
+  }
 }
 
 function sendPromptWithHiddenChatGptAccessibility(prompt) {
@@ -1338,6 +1370,446 @@ function sendPromptWithHiddenChatGptAccessibility(prompt) {
     responseMode: "devspace-result-file",
   };
 }
+
+function sendPromptWithVisibleChatGpt(prompt) {
+  try {
+    return sendPromptWithVisibleChatGptAx(prompt);
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    const fallback = sendPromptWithVisibleChatGptKeyboard(prompt);
+    return {
+      ...fallback,
+      visibleAxAttempt: {
+        ok: false,
+        reason,
+      },
+    };
+  }
+}
+
+function sendPromptWithVisibleChatGptAx(prompt) {
+  const launch = spawnSync("/usr/bin/open", ["-b", "com.openai.chat", "-u", "chatgpt://new-conversation"], {
+    encoding: "utf8",
+    timeout: 15_000,
+    maxBuffer: 1024 * 1024,
+  });
+  if (launch.error) {
+    throw new Error(`ChatGPT visible launch failed: ${launch.error.message}`);
+  }
+  if (launch.status !== 0) {
+    throw new Error(`ChatGPT visible launch failed with exit ${launch.status}: ${preview(launch.stderr || launch.stdout)}`);
+  }
+
+  const delivery = runChatGptVisibleAx("sendPrompt", { prompt });
+  const finalHide = hideChatGptAppQuietly();
+  return {
+    ok: true,
+    transport: "chatgpt-app-visible-accessibility",
+    backgroundOnly: false,
+    delivery,
+    finalHide,
+    promptBytes: Buffer.byteLength(prompt, "utf8"),
+    responseMode: "devspace-result-file",
+  };
+}
+
+function sendPromptWithVisibleChatGptKeyboard(prompt) {
+  const launch = spawnSync("/usr/bin/open", ["-b", "com.openai.chat", "-u", "chatgpt://new-conversation"], {
+    encoding: "utf8",
+    timeout: 15_000,
+    maxBuffer: 1024 * 1024,
+  });
+  if (launch.error) {
+    throw new Error(`ChatGPT visible launch failed: ${launch.error.message}`);
+  }
+  if (launch.status !== 0) {
+    throw new Error(`ChatGPT visible launch failed with exit ${launch.status}: ${preview(launch.stderr || launch.stdout)}`);
+  }
+
+  const oldClipboard = readClipboardText();
+  writeClipboardText(prompt);
+  let delivery;
+  try {
+    delivery = runChatGptVisibleKeyboard();
+  } finally {
+    if (oldClipboard.ok) writeClipboardText(oldClipboard.text);
+  }
+  const finalHide = hideChatGptAppQuietly();
+
+  return {
+    ok: true,
+    transport: "chatgpt-app-visible-keyboard",
+    backgroundOnly: false,
+    delivery,
+    finalHide,
+    promptBytes: Buffer.byteLength(prompt, "utf8"),
+    responseMode: "devspace-result-file",
+  };
+}
+
+function runChatGptVisibleAx(action, payload) {
+  const result = spawnSync("/usr/bin/osascript", [
+    "-l",
+    "JavaScript",
+    "-e",
+    CHATGPT_VISIBLE_AX_JXA,
+    JSON.stringify({ action, payload }),
+  ], {
+    encoding: "utf8",
+    timeout: 30_000,
+    maxBuffer: 10 * 1024 * 1024,
+  });
+  if (result.error) {
+    if (result.error.code === "ETIMEDOUT") {
+      throw new Error("CHATGPT_VISIBLE_AX_TIMEOUT: Visible ChatGPT Accessibility automation timed out before submitting the prompt.");
+    }
+    throw new Error(`CHATGPT_VISIBLE_AX_FAILED: ${result.error.message}`);
+  }
+  if (result.status !== 0) {
+    throw new Error(`CHATGPT_VISIBLE_AX_FAILED: ${preview(result.stderr || result.stdout)}`);
+  }
+  const raw = result.stdout.trim().split(/\r?\n/).filter(Boolean).at(-1) ?? "";
+  const parsed = readJsonFromString(raw, null);
+  if (!parsed) {
+    throw new Error(`CHATGPT_VISIBLE_AX_FAILED: non-JSON output from osascript: ${preview(result.stdout || result.stderr)}`);
+  }
+  if (!parsed.ok) {
+    throw new Error(`${parsed.code || "CHATGPT_VISIBLE_AX_FAILED"}: ${parsed.message || "Visible ChatGPT Accessibility automation failed."}`);
+  }
+  return parsed.value;
+}
+
+const CHATGPT_VISIBLE_AX_JXA = String.raw`
+function run(argv) {
+  try {
+    var request = JSON.parse(argv[0] || "{}");
+    if (request.action !== "sendPrompt") fail("CHATGPT_UNKNOWN_ACTION", "Unknown ChatGPT action: " + request.action);
+    return JSON.stringify({ ok: true, value: sendPrompt(String((request.payload || {}).prompt || "")) });
+  } catch (error) {
+    return JSON.stringify({ ok: false, code: error.code || "CHATGPT_VISIBLE_AX_FAILED", message: String(error.message || error), details: error.details || null });
+  }
+}
+
+function sendPrompt(prompt) {
+  if (!prompt.trim()) fail("CHATGPT_EMPTY_PROMPT", "Refusing to send an empty ChatGPT prompt.");
+  var systemEvents = Application("System Events");
+  if (!systemEvents.uiElementsEnabled()) fail("MACOS_ACCESSIBILITY_DISABLED", "macOS Accessibility automation is not enabled for the current process.");
+  var frontmostBefore = frontmostProcessName(systemEvents);
+  var chatgpt = Application("ChatGPT");
+  try {
+    if (chatgpt.id() !== "com.openai.chat") fail("CHATGPT_BUNDLE_MISMATCH", "The application named ChatGPT did not resolve to bundle id com.openai.chat.");
+  } catch (error) {
+    fail("CHATGPT_APP_NOT_FOUND", "The ChatGPT desktop app is not installed or registered with LaunchServices.");
+  }
+  chatgpt.activate();
+  var proc = waitForProcessWindow(systemEvents, "ChatGPT", 15000);
+  proc.frontmost = true;
+  delay(0.3);
+  var window = proc.windows()[0];
+  clickNewChatIfAvailable(window);
+  delay(0.5);
+  var composer = waitForComposer(window, 15000);
+  composer.value = prompt;
+  delay(0.2);
+  var actual = String(safeValue(function() { return composer.value(); }) || "");
+  if (actual.trim() !== prompt.trim()) {
+    fail("CHATGPT_PROMPT_NOT_SET", "Could not set the ChatGPT app composer text through Accessibility.", {
+      actualLength: actual.length,
+      promptLength: prompt.length
+    });
+  }
+  sendComposerPrompt(window, composer);
+  var accepted = waitForPromptAccepted(composer, prompt, 5000);
+  return {
+    composerRole: safeString(function() { return composer.role(); }),
+    accepted: accepted,
+    frontmostBefore: frontmostBefore,
+    frontmostProcessName: frontmostProcessName(systemEvents),
+    visible: proc.visible(),
+    windows: proc.windows().length
+  };
+}
+
+function waitForProcessWindow(systemEvents, name, timeoutMs) {
+  var deadline = Date.now() + timeoutMs;
+  var proc = systemEvents.processes.byName(name);
+  while (Date.now() < deadline) {
+    try {
+      if (proc.exists() && proc.windows().length > 0) return proc;
+    } catch (_) {}
+    delay(0.25);
+    proc = systemEvents.processes.byName(name);
+  }
+  fail("CHATGPT_WINDOW_MISSING", "No ChatGPT app window is available for visible automation.");
+}
+
+function clickNewChatIfAvailable(window) {
+  var buttons = toolbarButtons(window);
+  if (buttons.length === 0) {
+    buttons = descendants(window).filter(function(node) {
+      return safeString(function() { return node.role(); }) === "AXButton";
+    });
+  }
+  for (var i = 0; i < buttons.length; i++) {
+    var label = normalizeText([
+      safeString(function() { return buttons[i].description(); }),
+      safeString(function() { return buttons[i].name(); }),
+      safeString(function() { return buttons[i].value(); })
+    ].join(" "));
+    if (/^New chat$/i.test(label)) {
+      pressElement(buttons[i]);
+      return;
+    }
+  }
+}
+
+function toolbarButtons(window) {
+  var buttons = [];
+  try {
+    var toolbars = window.toolbars();
+    for (var t = 0; t < toolbars.length; t++) {
+      var list = toolbars[t].buttons();
+      for (var i = 0; i < list.length; i++) buttons.push(list[i]);
+    }
+  } catch (_) {}
+  return buttons;
+}
+
+function waitForComposer(window, timeoutMs) {
+  var deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    var nodes = descendants(window);
+    for (var i = 0; i < nodes.length; i++) {
+      if (safeString(function() { return nodes[i].role(); }) === "AXTextArea") return nodes[i];
+    }
+    delay(0.25);
+  }
+  fail("CHATGPT_COMPOSER_MISSING", "Could not find the ChatGPT app composer text area.");
+}
+
+function sendComposerPrompt(window, composer) {
+  var sendButton = findSendButton(descendants(window), composer);
+  if (!sendButton) fail("CHATGPT_SEND_BUTTON_MISSING", "Could not find the ChatGPT app send button after setting the composer text.");
+  pressElement(sendButton);
+  delay(0.4);
+}
+
+function waitForPromptAccepted(composer, promptText, timeoutMs) {
+  var deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    var value = safeString(function() { return composer.value(); });
+    if (normalizeText(value) !== normalizeText(promptText)) return true;
+    delay(0.25);
+  }
+  fail("CHATGPT_SEND_NOT_CONFIRMED", "The ChatGPT app composer still contained the prompt after pressing Send.", {
+    composerValueLength: String(safeString(function() { return composer.value(); }) || "").length,
+    promptLength: String(promptText || "").length
+  });
+}
+
+function findSendButton(nodes, composer) {
+  var composerRecord = recordForNode(composer);
+  var best = null;
+  var bestScore = -Infinity;
+  for (var i = 0; i < nodes.length; i++) {
+    if (safeString(function() { return nodes[i].role(); }) !== "AXButton") continue;
+    var record = recordForNode(nodes[i]);
+    if (record.enabled === "false" || !record.position || !record.size) continue;
+    if (!isPossibleSendButton(record, composerRecord)) continue;
+    var score = sendButtonScore(record, composerRecord);
+    if (score > bestScore) {
+      best = nodes[i];
+      bestScore = score;
+    }
+  }
+  return best;
+}
+
+function isPossibleSendButton(button, composer) {
+  if (!composer.position || !composer.size || !button.position || !button.size) return false;
+  var label = buttonLabel(button);
+  if (/ChatGPT|New chat|Share|Move|Sidebar|close|minimize|full screen|5\.\d|4\.5|o3|Pro|Thinking|Instant/i.test(label)) return false;
+  var buttonCenterY = button.position.y + button.size.height / 2;
+  var composerBottomY = composer.position.y + Math.min(composer.size.height, 360);
+  var nearComposerControlsRow = buttonCenterY >= composer.position.y - 40 && buttonCenterY <= composerBottomY + 80;
+  var rightOfComposer = button.position.x > composer.position.x + Math.max(180, composer.size.width * 0.35);
+  var reasonableSize = button.size.width >= 16 && button.size.width <= 80 && button.size.height >= 16 && button.size.height <= 80;
+  return nearComposerControlsRow && rightOfComposer && reasonableSize;
+}
+
+function sendButtonScore(button, composer) {
+  var verticalPenalty = Math.abs((button.position.y + button.size.height / 2) - (composer.position.y + composer.size.height / 2));
+  return button.position.x - verticalPenalty * 4;
+}
+
+function descendants(root) {
+  var output = [];
+  var stack = [root];
+  while (stack.length > 0 && output.length < 4000) {
+    var current = stack.pop();
+    var children = [];
+    try { children = current.uiElements(); } catch (_) {}
+    for (var i = children.length - 1; i >= 0; i--) stack.push(children[i]);
+    for (var j = 0; j < children.length; j++) output.push(children[j]);
+  }
+  return output;
+}
+
+function recordForNode(node) {
+  return {
+    role: safeString(function() { return node.role(); }),
+    name: safeString(function() { return node.name(); }),
+    description: safeString(function() { return node.description(); }),
+    value: safeString(function() { return node.value(); }),
+    enabled: safeString(function() { return node.enabled(); }),
+    position: pointFromArray(safeValue(function() { return node.position(); })),
+    size: sizeFromArray(safeValue(function() { return node.size(); }))
+  };
+}
+
+function buttonLabel(record) {
+  return normalizeText([record.description, record.name, record.value].filter(Boolean).join(" "));
+}
+
+function pressElement(element) {
+  try {
+    element.actions.byName("AXPress").perform();
+    return;
+  } catch (_) {}
+  try {
+    element.click();
+    return;
+  } catch (_) {}
+  fail("CHATGPT_AXPRESS_UNAVAILABLE", "A required ChatGPT app control did not expose a usable press action.");
+}
+
+function pointFromArray(value) {
+  if (!Array.isArray(value) || value.length < 2) return null;
+  return { x: Number(value[0]), y: Number(value[1]) };
+}
+
+function sizeFromArray(value) {
+  if (!Array.isArray(value) || value.length < 2) return null;
+  return { width: Number(value[0]), height: Number(value[1]) };
+}
+
+function safeValue(callback) {
+  try { return callback(); } catch (_) { return null; }
+}
+
+function safeString(callback) {
+  var value = safeValue(callback);
+  if (value === null || value === undefined) return "";
+  return String(value);
+}
+
+function normalizeText(value) {
+  return String(value || "").replace(/\s+/g, " ").trim();
+}
+
+function frontmostProcessName(systemEvents) {
+  try {
+    var frontmost = systemEvents.processes.whose({ frontmost: true })();
+    if (frontmost.length > 0) return safeString(function() { return frontmost[0].name(); });
+  } catch (_) {}
+  return "";
+}
+
+function fail(code, message, details) {
+  var error = new Error(message);
+  error.code = code;
+  error.details = details || null;
+  throw error;
+}
+`;
+
+function readClipboardText() {
+  const result = spawnSync("/usr/bin/pbpaste", [], {
+    encoding: "utf8",
+    timeout: 5_000,
+    maxBuffer: 10 * 1024 * 1024,
+  });
+  if (result.error || result.status !== 0) {
+    return { ok: false, text: "" };
+  }
+  return { ok: true, text: result.stdout };
+}
+
+function writeClipboardText(text) {
+  const result = spawnSync("/usr/bin/pbcopy", [], {
+    input: text,
+    encoding: "utf8",
+    timeout: 5_000,
+    maxBuffer: 1024 * 1024,
+  });
+  if (result.error) throw new Error(`Unable to write ChatGPT prompt to clipboard: ${result.error.message}`);
+  if (result.status !== 0) {
+    throw new Error(`Unable to write ChatGPT prompt to clipboard: ${preview(result.stderr || result.stdout)}`);
+  }
+}
+
+function runChatGptVisibleKeyboard() {
+  const result = spawnSync("/usr/bin/osascript", ["-e", CHATGPT_VISIBLE_KEYBOARD_APPLESCRIPT], {
+    encoding: "utf8",
+    timeout: 30_000,
+    maxBuffer: 1024 * 1024,
+  });
+  if (result.error) {
+    if (result.error.code === "ETIMEDOUT") {
+      throw new Error("CHATGPT_VISIBLE_AUTOMATION_TIMEOUT: Visible ChatGPT keyboard automation timed out before submitting the prompt.");
+    }
+    throw new Error(`CHATGPT_VISIBLE_AUTOMATION_FAILED: ${result.error.message}`);
+  }
+  if (result.status !== 0) {
+    throw new Error(`CHATGPT_VISIBLE_AUTOMATION_FAILED: ${preview(result.stderr || result.stdout)}`);
+  }
+  const parsed = readJsonFromString(result.stdout.trim().split(/\r?\n/).filter(Boolean).at(-1) ?? "", null);
+  if (!parsed) {
+    throw new Error(`CHATGPT_VISIBLE_AUTOMATION_FAILED: non-JSON output from osascript: ${preview(result.stdout || result.stderr)}`);
+  }
+  if (!parsed.ok) {
+    throw new Error(`${parsed.code || "CHATGPT_VISIBLE_AUTOMATION_FAILED"}: ${parsed.message || "Visible ChatGPT automation failed."}`);
+  }
+  return parsed.value;
+}
+
+const CHATGPT_VISIBLE_KEYBOARD_APPLESCRIPT = `
+on run
+  try
+    tell application "ChatGPT" to activate
+    tell application "System Events"
+      set deadline to ((current date) + 15)
+      repeat while (current date) is less than deadline
+        if exists process "ChatGPT" then
+          tell process "ChatGPT"
+            set frontmost to true
+            if (count of windows) > 0 then exit repeat
+          end tell
+        end if
+        delay 0.2
+      end repeat
+      if not (exists process "ChatGPT") then error "ChatGPT process not found after launch."
+      tell process "ChatGPT"
+        if (count of windows) = 0 then error "ChatGPT has no window for visible keyboard automation."
+        set frontmost to true
+      end tell
+      delay 0.5
+      keystroke "v" using {command down}
+      delay 0.5
+      key code 36
+      delay 0.5
+      tell process "ChatGPT"
+        set isFrontmost to frontmost
+        set isVisible to visible
+        set windowCount to count of windows
+      end tell
+      return "{\\"ok\\":true,\\"value\\":{\\"frontmost\\":" & isFrontmost & ",\\"visible\\":" & isVisible & ",\\"windows\\":" & windowCount & "}}"
+    end tell
+  on error errMsg number errNum
+    return "{\\"ok\\":false,\\"code\\":\\"CHATGPT_VISIBLE_AUTOMATION_FAILED\\",\\"message\\":\\"Visible ChatGPT automation failed with AppleScript error " & errNum & ".\\"}"
+  end try
+end run
+`;
 
 function ensureChatGptHiddenWindow() {
   let state = chatGptVisibilityState();
@@ -2120,15 +2592,17 @@ Usage:
   node scripts/devspace_manager.mjs start [--roots /path/a,/path/b] [--port 7676]
   node scripts/devspace_manager.mjs harness [--roots /path/a,/path/b] [--port 7676] [--deep] [--write-test]
   node scripts/devspace_manager.mjs debug [--roots /path/a] "debug audit this repo"
-  node scripts/devspace_manager.mjs task "deep debug audit this repo" [--roots /path/a] [--allow-edits] [--send chatgpt-app|none]
+  node scripts/devspace_manager.mjs task "deep debug audit this repo" [--roots /path/a] [--allow-edits] [--send chatgpt-app-auto|chatgpt-app-hidden|chatgpt-app-visible|none]
   node scripts/devspace_manager.mjs status
   node scripts/devspace_manager.mjs doctor
   node scripts/devspace_manager.mjs stop
 
 The task command starts and verifies DevSpace, writes a ChatGPT-ready delegated task prompt,
 and sends that prompt through DevSpace Manager's built-in ChatGPT app control channel by default.
+The default sender is automatic: it tries hidden Accessibility first, then visible Accessibility,
+then visible keyboard paste, and hides ChatGPT again after visible submission.
 Use --send none only to generate the prompt/result metadata without contacting ChatGPT.
-The debug/audit/review/fix/analyze aliases use the same task flow and default to --send chatgpt-app.
+The debug/audit/review/fix/analyze aliases use the same task flow and default to --send chatgpt-app-auto.
 Only one start/stop/task/harness command may run at a time.
 The Owner password is stored in ~/.devspace/auth.json.
 `);

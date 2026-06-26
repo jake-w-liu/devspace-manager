@@ -630,13 +630,16 @@ async function stop({ print }) {
   }
   safeRemoveFile(STATUS_PATH, "managed status file");
   safeRemoveFile(join(MANAGER_DIR, "cloudflared.pid"), "managed cloudflared pid file");
-  if (print) printJson({ ok: true, killed });
+  const ok = killed.every((entry) => !entry.error);
+  if (print) printJson({ ok, killed });
+  if (!ok) process.exitCode = 1;
 }
 
 async function printStatus() {
   const status = loadStatus();
   if (!status) {
     printJson({ ok: false, running: false, reason: "No managed DevSpace status file found." });
+    process.exitCode = 1;
     return;
   }
   const checks = await quickReachability(status.publicBaseUrl, status.port);
@@ -644,14 +647,16 @@ async function printStatus() {
   const cloudflaredAlive = status.cloudflaredPid ? isAlive(status.cloudflaredPid) : null;
   const processesAlive = Boolean(devspaceAlive && (cloudflaredAlive ?? true));
   const reachable = Boolean(checks.localDiscovery && checks.publicDiscovery);
-  printJson({
+  const result = {
     ok: processesAlive && reachable,
     running: true,
     devspaceAlive,
     cloudflaredAlive,
     ...status,
     reachability: checks,
-  });
+  };
+  printJson(result);
+  if (!result.ok) process.exitCode = 1;
 }
 
 async function doctor() {
@@ -659,13 +664,15 @@ async function doctor() {
   const result = spawnSync("devspace", ["doctor"], { encoding: "utf8" });
   const status = loadStatus();
   const checks = status ? await runChecks(status, { deep: false }) : [];
-  printJson({
+  const output = {
     ok: result.status === 0 && checks.every((check) => check.ok),
     devspaceDoctorExitCode: result.status,
     devspaceDoctorStdout: result.stdout.trim(),
     devspaceDoctorStderr: result.stderr.trim(),
     checks,
-  });
+  };
+  printJson(output);
+  if (!output.ok) process.exitCode = 1;
 }
 
 async function runChecks(status, options = {}) {

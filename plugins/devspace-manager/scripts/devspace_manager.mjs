@@ -115,7 +115,7 @@ async function runCommand(command, options) {
       return;
     case "task":
     case "delegate":
-      await task(options);
+      await task({ ...options, send: options.send ?? "chatgpt-app" });
       return;
     case "live-check":
     case "chatgpt-check":
@@ -327,7 +327,7 @@ async function task(options) {
     if (options.send !== "chatgpt-app") {
       throw new Error(`Unsupported --send target: ${options.send}`);
     }
-    sendResult = await sendPromptWithChatGptApp({
+    sendResult = await sendPromptWithChatGptAppResult({
       prompt: chatGptPrompt,
       timeoutMs: parseTimeoutMs(options.timeoutMs ?? DEFAULT_TASK_TIMEOUT_MS),
       resultFilePath,
@@ -406,7 +406,7 @@ async function chatGptLiveCheck(options) {
 
   let sendResult;
   try {
-    sendResult = await sendPromptWithChatGptApp({
+    sendResult = await sendPromptWithChatGptAppResult({
       prompt: chatGptPrompt,
       timeoutMs: parseTimeoutMs(options.timeoutMs ?? DEFAULT_TASK_TIMEOUT_MS),
       resultFilePath,
@@ -433,6 +433,8 @@ async function chatGptLiveCheck(options) {
     send: sendResult,
     reason: markerFound
       ? "ChatGPT wrote the marker to the DevSpace exchange file after reading it through the DevSpace connector."
+      : sendResult?.reason
+        ? `Strict-background ChatGPT sender did not complete the live check: ${sendResult.reason}`
       : "ChatGPT did not write the live-check marker to the DevSpace exchange file. The ChatGPT app may not have accepted the hidden deep link, may not have the DevSpace connector configured, or did not use it.",
   };
   writeJson(resultPath, result, 0o600);
@@ -564,13 +566,38 @@ function safeRemovePath(path, label) {
     return;
   } catch (firstError) {
     try {
-      chmodSync(path, 0o600);
+      makePathTreeRemovable(path);
       rmSync(path, { recursive: true, force: true });
       return;
     } catch (secondError) {
       throw permissionAwareError(secondError, `Unable to remove ${label} at ${path}.`);
     }
   }
+}
+
+function makePathTreeRemovable(path) {
+  let info;
+  try {
+    info = statSync(path);
+  } catch {
+    return;
+  }
+  if (info.isDirectory()) {
+    try {
+      chmodSync(path, 0o700);
+    } catch {}
+    let entries = [];
+    try {
+      entries = readdirSync(path, { withFileTypes: true });
+    } catch {}
+    for (const entry of entries) {
+      makePathTreeRemovable(join(path, entry.name));
+    }
+    return;
+  }
+  try {
+    chmodSync(path, 0o600);
+  } catch {}
 }
 
 function permissionAwareError(error, prefix) {
@@ -1163,6 +1190,26 @@ function buildChatGptLiveCheckPrompt({ status, root, exchangeRoot, relativeMarke
   ].join("\n");
 }
 
+async function sendPromptWithChatGptAppResult(args) {
+  try {
+    return await sendPromptWithChatGptApp(args);
+  } catch (error) {
+    return {
+      ok: false,
+      status: "failed",
+      transport: "chatgpt-app-hidden-accessibility",
+      backgroundOnly: true,
+      resultFilePath: args.resultFilePath,
+      finalDeliveryText: readTextFileIfExists(args.resultFilePath),
+      reason: error instanceof Error ? error.message : String(error),
+      error: {
+        name: error instanceof Error ? error.name : "Error",
+        message: error instanceof Error ? error.message : String(error),
+      },
+    };
+  }
+}
+
 async function sendPromptWithChatGptApp({ prompt, timeoutMs, resultFilePath, expectText }) {
   if (process.platform !== "darwin") {
     throw new Error("ChatGPT app sending is only supported on macOS.");
@@ -1616,14 +1663,16 @@ async function httpStatus(url) {
 }
 
 async function httpStatusWithFetch(url) {
+  let timer = null;
   try {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 10_000);
+    timer = setTimeout(() => controller.abort(), 10_000);
     const response = await fetch(url, { redirect: "manual", signal: controller.signal });
-    clearTimeout(timer);
     return response.status;
   } catch {
     return null;
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
 
@@ -1800,12 +1849,18 @@ function parseRoots(raw) {
     .split(",")
     .map((root) => root.trim())
     .filter(Boolean)
-    .map((root) => resolve(root.replace(/^~/, homedir())));
+    .map((root) => resolve(expandHomePath(root)));
   if (roots.length === 0) throw new Error("At least one allowed root is required.");
   for (const root of roots) {
     if (!existsSync(root)) throw new Error(`Allowed root does not exist: ${root}`);
   }
   return roots;
+}
+
+function expandHomePath(path) {
+  if (path === "~") return homedir();
+  if (path.startsWith("~/")) return join(homedir(), path.slice(2));
+  return path;
 }
 
 function parsePort(port) {
@@ -1892,14 +1947,15 @@ Usage:
   node scripts/devspace_manager.mjs start [--roots /path/a,/path/b] [--port 7676]
   node scripts/devspace_manager.mjs harness [--roots /path/a,/path/b] [--port 7676] [--deep] [--write-test]
   node scripts/devspace_manager.mjs debug [--roots /path/a] "debug audit this repo"
-  node scripts/devspace_manager.mjs task "deep debug audit this repo" [--roots /path/a] [--allow-edits] [--send chatgpt-app]
+  node scripts/devspace_manager.mjs task "deep debug audit this repo" [--roots /path/a] [--allow-edits] [--send chatgpt-app|none]
   node scripts/devspace_manager.mjs status
   node scripts/devspace_manager.mjs doctor
   node scripts/devspace_manager.mjs stop
 
 The task command starts and verifies DevSpace, writes a ChatGPT-ready delegated task prompt,
-and can optionally send that prompt through DevSpace Manager's built-in ChatGPT app control channel.
-The debug/audit/review/fix/analyze aliases use the task flow and default to --send chatgpt-app.
+and sends that prompt through DevSpace Manager's built-in ChatGPT app control channel by default.
+Use --send none only to generate the prompt/result metadata without contacting ChatGPT.
+The debug/audit/review/fix/analyze aliases use the same task flow and default to --send chatgpt-app.
 Only one start/stop/task/harness command may run at a time.
 The Owner password is stored in ~/.devspace/auth.json.
 `);

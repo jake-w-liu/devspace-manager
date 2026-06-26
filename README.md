@@ -68,7 +68,9 @@ Keep that password private.
 
 ## Delegate Work To ChatGPT
 
-Use `task` when Codex should hand work to ChatGPT while DevSpace provides file access:
+Use `task` when Codex should hand work to ChatGPT while DevSpace provides file access. `task`,
+`delegate`, and the audit/debug/review/fix aliases send through the built-in strict-background
+ChatGPT app sender by default:
 
 ```bash
 node scripts/devspace_manager.mjs task --roots "$PWD" "deep debug audit the codebase"
@@ -91,6 +93,9 @@ To be explicit about the internal ChatGPT app sender:
 ```bash
 node scripts/devspace_manager.mjs task --roots "$PWD" --send chatgpt-app "deep debug audit the codebase"
 ```
+
+Use `--send none` only when you want DevSpace Manager to prepare the prompt/result metadata without
+contacting ChatGPT.
 
 That sends only instructions through the ChatGPT app. ChatGPT still reads, writes, and runs commands through the DevSpace MCP connector, and task completion is verified by the result file ChatGPT writes back through DevSpace.
 

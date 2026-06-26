@@ -1438,6 +1438,7 @@ async function sendPromptWithChatGptAppResult(args) {
         name: error instanceof Error ? error.name : "Error",
         message: error instanceof Error ? error.message : String(error),
       },
+      attempts: error instanceof Error ? error.chatGptAttempts ?? undefined : undefined,
     };
   }
 }
@@ -1911,14 +1912,19 @@ function sendPromptWithChatGptTransport(prompt, sendTarget) {
     return sendPromptWithHiddenChatGptAccessibility(prompt);
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
-    const fallback = sendPromptWithVisibleChatGpt(prompt);
-    return {
-      ...fallback,
-      hiddenAttempt: {
-        ok: false,
-        reason,
-      },
-    };
+    const hiddenAttempt = { ok: false, reason };
+    try {
+      const fallback = sendPromptWithVisibleChatGpt(prompt);
+      return {
+        ...fallback,
+        hiddenAttempt,
+      };
+    } catch (visibleError) {
+      throw attachChatGptAttempts(visibleError, {
+        hiddenAttempt,
+        visibleAttempt: failedAttemptFromError(visibleError),
+      });
+    }
   }
 }
 
@@ -1965,15 +1971,19 @@ function sendPromptWithVisibleChatGpt(prompt) {
     return sendPromptWithVisibleChatGptAx(prompt);
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
-    if (/CHATGPT_WINDOW_MISSING/i.test(reason)) throw error;
-    const fallback = sendPromptWithVisibleChatGptKeyboard(prompt);
-    return {
-      ...fallback,
-      visibleAxAttempt: {
-        ok: false,
-        reason,
-      },
-    };
+    const visibleAxAttempt = { ok: false, reason };
+    try {
+      const fallback = sendPromptWithVisibleChatGptKeyboard(prompt);
+      return {
+        ...fallback,
+        visibleAxAttempt,
+      };
+    } catch (keyboardError) {
+      throw attachChatGptAttempts(keyboardError, {
+        visibleAxAttempt,
+        visibleKeyboardAttempt: failedAttemptFromError(keyboardError),
+      });
+    }
   }
 }
 
@@ -2018,12 +2028,31 @@ function sendPromptWithVisibleChatGptKeyboard(prompt) {
     throw new Error(`ChatGPT visible launch failed with exit ${launch.status}: ${preview(launch.stderr || launch.stdout)}`);
   }
 
-  const windowState = ensureVisibleChatGptWindow("visible keyboard automation");
   const oldClipboard = readClipboardText();
   writeClipboardText(prompt);
   let delivery;
+  let windowState;
   try {
-    delivery = runChatGptVisibleKeyboard();
+    try {
+      windowState = ensureVisibleChatGptWindow("visible keyboard automation");
+      delivery = runChatGptVisibleKeyboard();
+    } catch (error) {
+      const accessibilityReason = error instanceof Error ? error.message : String(error);
+      if (!/CHATGPT_WINDOW_MISSING/i.test(accessibilityReason)) throw error;
+      const accessibilityWindowAttempt = { ok: false, reason: accessibilityReason };
+      try {
+        windowState = ensureVisibleChatGptCoreGraphicsWindow("visible keyboard automation");
+        delivery = {
+          ...runChatGptCoreGraphicsKeyboard(),
+          accessibilityWindowAttempt,
+        };
+      } catch (coreGraphicsError) {
+        throw attachChatGptAttempts(coreGraphicsError, {
+          accessibilityWindowAttempt,
+          coreGraphicsKeyboardAttempt: failedAttemptFromError(coreGraphicsError),
+        });
+      }
+    }
   } finally {
     if (oldClipboard.ok) writeClipboardText(oldClipboard.text);
   }
@@ -2052,6 +2081,17 @@ function ensureVisibleChatGptWindow(label) {
   throw new Error(`CHATGPT_WINDOW_MISSING: ChatGPT has no accessible window for ${label}. Last state: ${JSON.stringify(state ?? chatGptVisibilityState())}`);
 }
 
+function ensureVisibleChatGptCoreGraphicsWindow(label) {
+  let state = waitForChatGptCoreGraphicsWindow(5_000);
+  if (state?.ok && state.windows > 0) return state;
+
+  runChatGptWindowRecovery();
+  state = waitForChatGptCoreGraphicsWindow(12_000);
+  if (state?.ok && state.windows > 0) return state;
+
+  throw new Error(`CHATGPT_CG_WINDOW_MISSING: ChatGPT has no visible CoreGraphics window for ${label}. Last state: ${JSON.stringify(state ?? {})}`);
+}
+
 function waitForChatGptWindow(timeoutMs) {
   const started = Date.now();
   let state = chatGptVisibilityState();
@@ -2061,6 +2101,21 @@ function waitForChatGptWindow(timeoutMs) {
     sleepSync(250);
   }
   return state;
+}
+
+function waitForChatGptCoreGraphicsWindow(timeoutMs) {
+  const started = Date.now();
+  let state = chatGptCoreGraphicsWindowState();
+  while (Date.now() - started < timeoutMs) {
+    state = chatGptCoreGraphicsWindowState();
+    if (state.ok && state.windows > 0) return state;
+    sleepSync(250);
+  }
+  return state;
+}
+
+function chatGptCoreGraphicsWindowState() {
+  return runChatGptSwiftJson(CHATGPT_CG_WINDOW_STATE_SWIFT, "CHATGPT_CG_WINDOW_STATE", 20_000);
 }
 
 function runChatGptWindowRecovery() {
@@ -2112,6 +2167,234 @@ function runChatGptVisibleAx(action, payload) {
   }
   return parsed.value;
 }
+
+function attachChatGptAttempts(error, attempts) {
+  const target = error instanceof Error ? error : new Error(String(error));
+  target.chatGptAttempts = {
+    ...(target.chatGptAttempts ?? {}),
+    ...attempts,
+  };
+  return target;
+}
+
+function failedAttemptFromError(error) {
+  return {
+    ok: false,
+    reason: error instanceof Error ? error.message : String(error),
+    attempts: error instanceof Error ? error.chatGptAttempts ?? undefined : undefined,
+  };
+}
+
+function runChatGptCoreGraphicsKeyboard() {
+  const parsed = runChatGptSwiftJson(CHATGPT_CG_KEYBOARD_SWIFT, "CHATGPT_CG_KEYBOARD", 30_000);
+  if (!parsed.ok) {
+    throw new Error(`${parsed.code || "CHATGPT_CG_KEYBOARD_FAILED"}: ${parsed.message || "CoreGraphics ChatGPT keyboard automation failed."}`);
+  }
+  return parsed.value;
+}
+
+function runChatGptSwiftJson(script, label, timeoutMs) {
+  const result = spawnSync("/usr/bin/swift", ["-"], {
+    input: script,
+    encoding: "utf8",
+    timeout: timeoutMs,
+    maxBuffer: 10 * 1024 * 1024,
+  });
+  if (result.error) {
+    if (result.error.code === "ETIMEDOUT") {
+      return { ok: false, code: `${label}_TIMEOUT`, message: `${label} timed out.` };
+    }
+    return { ok: false, code: `${label}_FAILED`, message: result.error.message };
+  }
+  const raw = result.stdout.trim().split(/\r?\n/).filter(Boolean).at(-1) ?? "";
+  const parsed = readJsonFromString(raw, null);
+  if (!parsed) {
+    return {
+      ok: false,
+      code: `${label}_FAILED`,
+      message: `Swift helper returned non-JSON output: ${preview(result.stderr || result.stdout)}`,
+    };
+  }
+  return parsed;
+}
+
+const CHATGPT_CG_WINDOW_STATE_SWIFT = String.raw`
+import AppKit
+import CoreGraphics
+import Foundation
+
+func emit(_ value: [String: Any]) {
+  if let data = try? JSONSerialization.data(withJSONObject: value, options: []),
+     let text = String(data: data, encoding: .utf8) {
+    print(text)
+  } else {
+    print("{\"ok\":false,\"code\":\"CHATGPT_CG_JSON_FAILED\",\"message\":\"Could not serialize CoreGraphics state.\"}")
+  }
+}
+
+let apps = NSRunningApplication.runningApplications(withBundleIdentifier: "com.openai.chat")
+let app = apps.first
+let activated = app?.activate(options: [.activateAllWindows]) ?? false
+Thread.sleep(forTimeInterval: 0.25)
+let frontmostBundleId = NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? ""
+let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+let windows = list.compactMap { item -> [String: Any]? in
+  guard String(describing: item[kCGWindowOwnerName as String] ?? "") == "ChatGPT" else { return nil }
+  guard (item[kCGWindowLayer as String] as? Int ?? -1) == 0 else { return nil }
+  guard let bounds = item[kCGWindowBounds as String] as? [String: Any] else { return nil }
+  let width = bounds["Width"] as? Double ?? 0
+  let height = bounds["Height"] as? Double ?? 0
+  guard width > 80 && height > 80 else { return nil }
+  return [
+    "number": item[kCGWindowNumber as String] as? Int ?? 0,
+    "name": String(describing: item[kCGWindowName as String] ?? ""),
+    "x": bounds["X"] as? Double ?? 0,
+    "y": bounds["Y"] as? Double ?? 0,
+    "width": width,
+    "height": height,
+    "onscreen": item[kCGWindowIsOnscreen as String] as? Bool ?? false,
+  ]
+}.sorted {
+  let leftArea = ($0["width"] as? Double ?? 0) * ($0["height"] as? Double ?? 0)
+  let rightArea = ($1["width"] as? Double ?? 0) * ($1["height"] as? Double ?? 0)
+  return leftArea > rightArea
+}
+
+emit([
+  "ok": true,
+  "source": "coregraphics",
+  "appRunning": app != nil,
+  "activationRequested": activated,
+  "frontmostBundleId": frontmostBundleId,
+  "windows": windows.count,
+  "window": windows.first ?? NSNull(),
+])
+`;
+
+const CHATGPT_CG_KEYBOARD_SWIFT = String.raw`
+import AppKit
+import CoreGraphics
+import Foundation
+
+func emit(_ value: [String: Any]) {
+  if let data = try? JSONSerialization.data(withJSONObject: value, options: []),
+     let text = String(data: data, encoding: .utf8) {
+    print(text)
+  } else {
+    print("{\"ok\":false,\"code\":\"CHATGPT_CG_JSON_FAILED\",\"message\":\"Could not serialize CoreGraphics result.\"}")
+  }
+}
+
+func fail(_ code: String, _ message: String, _ details: [String: Any] = [:]) -> Never {
+  var output = details
+  output["ok"] = false
+  output["code"] = code
+  output["message"] = message
+  emit(output)
+  exit(0)
+}
+
+func chatGptWindows() -> [[String: Any]] {
+  let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+  return list.compactMap { item -> [String: Any]? in
+    guard String(describing: item[kCGWindowOwnerName as String] ?? "") == "ChatGPT" else { return nil }
+    guard (item[kCGWindowLayer as String] as? Int ?? -1) == 0 else { return nil }
+    guard let bounds = item[kCGWindowBounds as String] as? [String: Any] else { return nil }
+    let width = bounds["Width"] as? Double ?? 0
+    let height = bounds["Height"] as? Double ?? 0
+    guard width > 80 && height > 80 else { return nil }
+    return [
+      "number": item[kCGWindowNumber as String] as? Int ?? 0,
+      "name": String(describing: item[kCGWindowName as String] ?? ""),
+      "x": bounds["X"] as? Double ?? 0,
+      "y": bounds["Y"] as? Double ?? 0,
+      "width": width,
+      "height": height,
+      "onscreen": item[kCGWindowIsOnscreen as String] as? Bool ?? false,
+    ]
+  }.sorted {
+    let leftArea = ($0["width"] as? Double ?? 0) * ($0["height"] as? Double ?? 0)
+    let rightArea = ($1["width"] as? Double ?? 0) * ($1["height"] as? Double ?? 0)
+    return leftArea > rightArea
+  }
+}
+
+func postKey(_ keyCode: CGKeyCode, flags: CGEventFlags = []) {
+  guard let down = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: true),
+        let up = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: false) else {
+    fail("CHATGPT_CG_EVENT_FAILED", "Could not create keyboard event.")
+  }
+  down.flags = flags
+  up.flags = flags
+  down.post(tap: .cghidEventTap)
+  usleep(120_000)
+  up.post(tap: .cghidEventTap)
+  usleep(180_000)
+}
+
+func click(_ x: Double, _ y: Double) {
+  let point = CGPoint(x: x, y: y)
+  guard let down = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: point, mouseButton: .left),
+        let up = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: point, mouseButton: .left) else {
+    fail("CHATGPT_CG_EVENT_FAILED", "Could not create mouse event.")
+  }
+  down.post(tap: .cghidEventTap)
+  usleep(100_000)
+  up.post(tap: .cghidEventTap)
+  usleep(350_000)
+}
+
+let apps = NSRunningApplication.runningApplications(withBundleIdentifier: "com.openai.chat")
+guard let app = apps.first else {
+  fail("CHATGPT_APP_NOT_RUNNING", "ChatGPT.app is not running.")
+}
+
+let activated = app.activate(options: [.activateAllWindows])
+Thread.sleep(forTimeInterval: 0.75)
+var windows = chatGptWindows()
+guard let window = windows.first else {
+  fail("CHATGPT_CG_WINDOW_MISSING", "ChatGPT has no visible CoreGraphics window.", [
+    "activationRequested": activated,
+    "frontmostBundleId": NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "",
+  ])
+}
+
+let x = window["x"] as? Double ?? 0
+let y = window["y"] as? Double ?? 0
+let width = window["width"] as? Double ?? 0
+let height = window["height"] as? Double ?? 0
+click(x + width / 2, y + height / 2)
+Thread.sleep(forTimeInterval: 0.4)
+let frontmostAfterClick = NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? ""
+guard frontmostAfterClick == "com.openai.chat" else {
+  fail("CHATGPT_CG_ACTIVATE_FAILED", "ChatGPT did not become frontmost; refusing to paste prompt into another app.", [
+    "activationRequested": activated,
+    "frontmostBundleId": frontmostAfterClick,
+    "window": window,
+  ])
+}
+
+postKey(45, flags: .maskCommand)
+Thread.sleep(forTimeInterval: 0.6)
+windows = chatGptWindows()
+let target = windows.first ?? window
+let tx = target["x"] as? Double ?? x
+let ty = target["y"] as? Double ?? y
+let tw = target["width"] as? Double ?? width
+let th = target["height"] as? Double ?? height
+click(tx + tw / 2, ty + th - min(max(th * 0.16, 70), 140))
+postKey(9, flags: .maskCommand)
+Thread.sleep(forTimeInterval: 0.4)
+postKey(36)
+
+emit([
+  "ok": true,
+  "transport": "coregraphics-keyboard",
+  "activationRequested": activated,
+  "frontmostBundleId": NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "",
+  "window": target,
+])
+`;
 
 const CHATGPT_VISIBLE_AX_JXA = String.raw`
 function run(argv) {

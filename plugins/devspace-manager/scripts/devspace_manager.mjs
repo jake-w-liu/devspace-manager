@@ -1930,6 +1930,13 @@ function parseRoots(raw) {
   if (roots.length === 0) throw new Error("At least one allowed root is required.");
   for (const root of roots) {
     if (!existsSync(root)) throw new Error(`Allowed root does not exist: ${root}`);
+    let rootStats;
+    try {
+      rootStats = statSync(root);
+    } catch (error) {
+      throw permissionAwareError(error, `Unable to inspect allowed root at ${root}.`);
+    }
+    if (!rootStats.isDirectory()) throw new Error(`Allowed root is not a directory: ${root}`);
   }
   return roots;
 }

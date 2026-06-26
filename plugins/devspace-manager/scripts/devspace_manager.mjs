@@ -640,11 +640,15 @@ async function printStatus() {
     return;
   }
   const checks = await quickReachability(status.publicBaseUrl, status.port);
+  const devspaceAlive = isAlive(status.devspacePid);
+  const cloudflaredAlive = status.cloudflaredPid ? isAlive(status.cloudflaredPid) : null;
+  const processesAlive = Boolean(devspaceAlive && (cloudflaredAlive ?? true));
+  const reachable = Boolean(checks.localDiscovery && checks.publicDiscovery);
   printJson({
-    ok: Boolean(isAlive(status.devspacePid) && (!status.cloudflaredPid || isAlive(status.cloudflaredPid))),
+    ok: processesAlive && reachable,
     running: true,
-    devspaceAlive: isAlive(status.devspacePid),
-    cloudflaredAlive: status.cloudflaredPid ? isAlive(status.cloudflaredPid) : null,
+    devspaceAlive,
+    cloudflaredAlive,
     ...status,
     reachability: checks,
   });

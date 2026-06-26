@@ -1226,6 +1226,9 @@ function selfTest() {
   assertCheck("automatic ChatGPT target reports visible fallback possibility", isBackgroundOnlySendTarget("chatgpt-app-auto") === false);
   assertCheck("visible ChatGPT target is not background-only", isBackgroundOnlySendTarget("chatgpt-app-visible") === false);
   assertCheck("JSON-RPC null id does not equal string null", jsonRpcIdEquals(null, "null") === false);
+  assertCheck("unknown macOS session state is not safe for GUI automation", macSessionStateAllowsGuiAutomation({ ok: false }) === false);
+  assertCheck("locked macOS session state is not safe for GUI automation", macSessionStateAllowsGuiAutomation({ ok: true, screenLocked: true }) === false);
+  assertCheck("unlocked macOS session state is safe for GUI automation", macSessionStateAllowsGuiAutomation({ ok: true, screenLocked: false }) === true);
 
   printJson({ ok: true, checks });
 }
@@ -2134,13 +2137,21 @@ function chatGptCoreGraphicsWindowState() {
 
 function assertMacSessionUnlocked(label) {
   const state = macSessionState();
-  if (state.ok && state.screenLocked) {
+  if (!macSessionStateAllowsGuiAutomation(state)) {
+    const code = state.ok ? "CHATGPT_SCREEN_LOCKED" : "CHATGPT_SESSION_STATE_UNKNOWN";
+    const reason = state.ok
+      ? `Cannot run ${label} while the macOS console session is locked.`
+      : `Cannot run ${label} because the macOS console lock state could not be verified.`;
     throw chatGptDiagnosticError(
-      "CHATGPT_SCREEN_LOCKED",
-      `Cannot run ${label} while the macOS console session is locked.`,
+      code,
+      reason,
       state
     );
   }
+}
+
+function macSessionStateAllowsGuiAutomation(state) {
+  return state?.ok === true && state.screenLocked === false;
 }
 
 function collectChatGptDiagnostics() {
@@ -3787,6 +3798,7 @@ The default sender is automatic: it tries hidden Accessibility first, then visib
 then visible keyboard paste, and hides ChatGPT again after visible submission.
 If the macOS console session is locked, ChatGPT GUI delivery fails fast with CHATGPT_SCREEN_LOCKED
 after DevSpace preflight instead of attempting unsafe paste automation.
+If the console lock state cannot be verified, delivery fails closed with CHATGPT_SESSION_STATE_UNKNOWN.
 Use --send none only to generate the prompt/result metadata without contacting ChatGPT.
 The debug/audit/review/fix/analyze aliases use the same task flow and default to --send chatgpt-app-auto.
 Only one start/stop/task/harness command may run at a time.

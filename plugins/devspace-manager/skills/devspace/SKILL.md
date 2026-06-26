@@ -17,7 +17,7 @@ Use this skill when the user asks to set up DevSpace, connect ChatGPT to local f
 node scripts/devspace_manager.mjs debug --roots "$PWD" "the user's task text"
 ```
 
-Use `--send none` only when the user explicitly does not want the prompt sent to ChatGPT. The `debug`, `audit`, `review`, `fix`, and `analyze` aliases default to `--send chatgpt-app-auto`, implemented inside DevSpace Manager. The default sender is automatic: hidden Accessibility first, visible Accessibility next, visible keyboard paste last. If visible fallback is needed, it submits automatically and hides ChatGPT again afterward. If the macOS console session is locked, GUI delivery fails fast with `CHATGPT_SCREEN_LOCKED` instead of attempting paste or keyboard automation.
+Use `--send none` only when the user explicitly does not want the prompt sent to ChatGPT. The `debug`, `audit`, `review`, `fix`, and `analyze` aliases default to `--send chatgpt-app-auto`, implemented inside DevSpace Manager. The default sender is automatic: hidden Accessibility first, visible Accessibility next, visible keyboard paste last. If visible fallback is needed, it submits automatically and hides ChatGPT again afterward. If the macOS console session is locked or cannot be verified as unlocked, GUI delivery fails fast with `CHATGPT_SCREEN_LOCKED` or `CHATGPT_SESSION_STATE_UNKNOWN` instead of attempting paste or keyboard automation.
 4. Prefer `harness --deep` after setup or changes. It starts the tunnel/server if needed and verifies:
    - DevSpace CLI is installed, plus at least one public tunnel provider: `npx` for deterministic localtunnel or Cloudflare Tunnel fallback.
    - Config and auth files exist with private file permissions.

@@ -1217,6 +1217,7 @@ async function sendPromptWithChatGptAppResult(args) {
   try {
     return await sendPromptWithChatGptApp(args);
   } catch (error) {
+    const finalHide = process.platform === "darwin" ? hideChatGptAppQuietly() : null;
     return {
       ok: false,
       status: "failed",
@@ -1224,6 +1225,7 @@ async function sendPromptWithChatGptAppResult(args) {
       backgroundOnly: true,
       resultFilePath: args.resultFilePath,
       finalDeliveryText: readTextFileIfExists(args.resultFilePath),
+      finalHide,
       reason: error instanceof Error ? error.message : String(error),
       error: {
         name: error instanceof Error ? error.name : "Error",
@@ -1291,14 +1293,22 @@ function sendPromptWithHiddenChatGptAccessibility(prompt) {
   }
   hideChatGptApp();
   ensureChatGptHiddenWindow();
-  const delivery = runChatGptHiddenAx("sendPrompt", { prompt });
-  const hideState = hideChatGptApp();
+  let delivery;
+  let finalHide;
+  try {
+    delivery = runChatGptHiddenAx("sendPrompt", { prompt });
+  } finally {
+    finalHide = hideChatGptAppQuietly();
+  }
+  if (!finalHide.ok) {
+    throw new Error(`ChatGPT remained visible after hidden automation: ${finalHide.reason}`);
+  }
   return {
     ok: true,
     transport: "chatgpt-app-hidden-accessibility",
     backgroundOnly: true,
     delivery,
-    hideState,
+    hideState: finalHide.state,
     promptBytes: Buffer.byteLength(prompt, "utf8"),
     responseMode: "devspace-result-file",
   };
@@ -1612,6 +1622,22 @@ function hideChatGptApp() {
     throw new Error("ChatGPT remained visible after hidden deep-link delivery.");
   }
   return state;
+}
+
+function hideChatGptAppQuietly(attempts = 3) {
+  let state = null;
+  let reason = null;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      state = hideChatGptApp();
+      return { ok: true, state };
+    } catch (error) {
+      reason = error instanceof Error ? error.message : String(error);
+      state = chatGptVisibilityState();
+      spawnSync("/bin/sleep", ["0.2"]);
+    }
+  }
+  return { ok: false, state, reason };
 }
 
 function chatGptVisibilityState() {

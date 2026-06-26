@@ -19,7 +19,7 @@ node scripts/devspace_manager.mjs debug --roots "$PWD" "the user's task text"
 
 Use `--send none` only when the user explicitly does not want the prompt sent to ChatGPT. The `debug`, `audit`, `review`, `fix`, and `analyze` aliases default to `--send chatgpt-app-auto`, implemented inside DevSpace Manager. The default sender is automatic: hidden Accessibility first, visible Accessibility next, visible keyboard paste last. If visible fallback is needed, it submits automatically and hides ChatGPT again afterward.
 4. Prefer `harness --deep` after setup or changes. It starts the tunnel/server if needed and verifies:
-   - DevSpace CLI is installed, plus at least one public tunnel provider: Cloudflare Tunnel or `npx` for localtunnel fallback.
+   - DevSpace CLI is installed, plus at least one public tunnel provider: `npx` for deterministic localtunnel or Cloudflare Tunnel fallback.
    - Config and auth files exist with private file permissions.
    - `devspace doctor` passes.
    - OAuth discovery works on localhost and the HTTPS tunnel.

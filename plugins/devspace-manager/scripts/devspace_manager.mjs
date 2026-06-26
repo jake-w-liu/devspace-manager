@@ -509,18 +509,27 @@ async function startOnce(options, lifecycle = { changedRuntimeState: false }) {
     if (checks.localDiscovery && checks.publicDiscovery) return existing;
   }
 
-  await stop({ print: false });
+  const reusableTunnel = canReuseManagedTunnelForRestart(existing, { port, options })
+    ? existing
+    : null;
+  if (reusableTunnel?.devspacePid) {
+    await waitForKilledProcesses(killPidGroup(reusableTunnel.devspacePid, "devspace"));
+  } else {
+    await stop({ print: false });
+  }
   lifecycle.changedRuntimeState = true;
   assertPortFree(port);
 
-  const tunnel = requestedPublicBaseUrl || options.noTunnel
+  const tunnel = reusableTunnel || requestedPublicBaseUrl || options.noTunnel
     ? null
     : await startPublicTunnel(port);
   const publicBaseUrl = requestedPublicBaseUrl
     ? requestedPublicBaseUrl
     : options.noTunnel
       ? `http://127.0.0.1:${port}`
-      : tunnel.publicBaseUrl;
+      : reusableTunnel
+        ? reusableTunnel.publicBaseUrl
+        : tunnel.publicBaseUrl;
 
   writeDevspaceFiles({ port, roots, publicBaseUrl });
   const devspaceEnv = {
@@ -535,9 +544,9 @@ async function startOnce(options, lifecycle = { changedRuntimeState: false }) {
     publicBaseUrl,
     publicMcpUrl: `${publicBaseUrl}/mcp`,
     localMcpUrl: `http://127.0.0.1:${port}/mcp`,
-    tunnelProvider: tunnel?.provider ?? (options.publicBaseUrl ? "external" : options.noTunnel ? "none" : null),
-    cloudflaredPid: tunnel?.provider === "cloudflared" ? readCloudflaredPid() : null,
-    localtunnelPid: tunnel?.provider === "localtunnel" ? readLocaltunnelPid() : null,
+    tunnelProvider: reusableTunnel?.tunnelProvider ?? tunnel?.provider ?? (options.publicBaseUrl ? "external" : options.noTunnel ? "none" : null),
+    cloudflaredPid: reusableTunnel?.cloudflaredPid ?? (tunnel?.provider === "cloudflared" ? readCloudflaredPid() : null),
+    localtunnelPid: reusableTunnel?.localtunnelPid ?? (tunnel?.provider === "localtunnel" ? readLocaltunnelPid() : null),
     devspacePid,
     logs: {
       cloudflared: CLOUDFLARED_LOG,
@@ -586,6 +595,14 @@ function managedTunnelAlive(status) {
   if (status.cloudflaredPid && !isAlive(status.cloudflaredPid)) return false;
   if (status.localtunnelPid && !isAlive(status.localtunnelPid)) return false;
   return true;
+}
+
+function canReuseManagedTunnelForRestart(status, { port, options }) {
+  if (!status || status.port !== port) return false;
+  if (options.publicBaseUrl || options.noTunnel) return false;
+  if (status.tunnelProvider !== "cloudflared" && status.tunnelProvider !== "localtunnel") return false;
+  if (!status.publicBaseUrl?.startsWith("https://")) return false;
+  return managedTunnelAlive(status);
 }
 
 function sameStringArray(left, right) {
@@ -2781,6 +2798,27 @@ function ensureAnyTunnelCommand() {
 
 async function startPublicTunnel(port) {
   const failures = [];
+  if (commandExists("npx")) {
+    try {
+      return {
+        provider: "localtunnel",
+        publicBaseUrl: await startLocaltunnel(port, { stable: true }),
+      };
+    } catch (error) {
+      failures.push(`localtunnel stable: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    try {
+      return {
+        provider: "localtunnel",
+        publicBaseUrl: await startLocaltunnel(port, { stable: false }),
+      };
+    } catch (error) {
+      failures.push(`localtunnel random: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  } else {
+    failures.push("localtunnel: npx command not found");
+  }
+
   if (commandExists("cloudflared")) {
     try {
       return {
@@ -2792,19 +2830,6 @@ async function startPublicTunnel(port) {
     }
   } else {
     failures.push("cloudflared: command not found");
-  }
-
-  if (commandExists("npx")) {
-    try {
-      return {
-        provider: "localtunnel",
-        publicBaseUrl: await startLocaltunnel(port),
-      };
-    } catch (error) {
-      failures.push(`localtunnel: ${error instanceof Error ? error.message : String(error)}`);
-    }
-  } else {
-    failures.push("localtunnel: npx command not found");
   }
 
   throw new Error(`Unable to start a public HTTPS tunnel. ${failures.join(" | ")}`);
@@ -2821,15 +2846,23 @@ function startCloudflared(port) {
   });
 }
 
-function startLocaltunnel(port) {
+function startLocaltunnel(port, { stable }) {
   writeFileSync(LOCALTUNNEL_LOG, "", { mode: 0o600 });
-  const pid = startDetached("npx", ["--yes", "localtunnel", "--port", String(port), "--local-host", "127.0.0.1"], LOCALTUNNEL_LOG);
+  const args = ["--yes", "localtunnel", "--port", String(port), "--local-host", "127.0.0.1"];
+  const expectedSubdomain = stable ? stableLocaltunnelSubdomain() : null;
+  if (expectedSubdomain) args.push("--subdomain", expectedSubdomain);
+  const pid = startDetached("npx", args, LOCALTUNNEL_LOG);
   writeFileSync(join(MANAGER_DIR, "localtunnel.pid"), String(pid), { mode: 0o600 });
-  return waitForLocaltunnelUrl().catch((error) => {
+  return waitForLocaltunnelUrl({ expectedSubdomain }).catch((error) => {
     killPidGroup(pid, "localtunnel");
     safeRemoveFile(join(MANAGER_DIR, "localtunnel.pid"), "managed localtunnel pid file");
     throw error;
   });
+}
+
+function stableLocaltunnelSubdomain() {
+  const seed = `${homedir()}:${process.env.USER ?? ""}:devspace-manager`;
+  return `devspace${createHash("sha256").update(seed).digest("hex").slice(0, 12)}`;
 }
 
 async function waitForCloudflaredUrl() {
@@ -2858,7 +2891,7 @@ async function waitForCloudflaredUrl() {
   throw new Error(`Timed out waiting for Cloudflare tunnel URL. See ${CLOUDFLARED_LOG}`);
 }
 
-async function waitForLocaltunnelUrl() {
+async function waitForLocaltunnelUrl({ expectedSubdomain = null } = {}) {
   const started = Date.now();
   let seenUrl = null;
   while (Date.now() - started < QUICK_TUNNEL_URL_TIMEOUT_MS) {
@@ -2867,6 +2900,9 @@ async function waitForLocaltunnelUrl() {
       const match = log.match(LOCALTUNNEL_URL_RE);
       if (match) {
         seenUrl = normalizePublicBaseUrl(match[0]);
+        if (expectedSubdomain && new URL(seenUrl).hostname !== `${expectedSubdomain}.loca.lt`) {
+          throw new Error(`Localtunnel did not assign requested stable subdomain ${expectedSubdomain}; got ${new URL(seenUrl).hostname}. See ${LOCALTUNNEL_LOG}`);
+        }
         if (await publicHostnameResolves(seenUrl)) return seenUrl;
       }
       const pid = readLocaltunnelPid();

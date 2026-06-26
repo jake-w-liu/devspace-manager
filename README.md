@@ -9,7 +9,7 @@ DevSpace Manager does not upload project archives to ChatGPT. It starts a local 
 - Installs as a Codex marketplace plugin.
 - Provides a `devspace` skill for repeatable setup, status, stop, and live-test workflows.
 - Starts `devspace serve` on `127.0.0.1:7676` by default.
-- Starts a Cloudflare quick tunnel when no public URL is provided, with automatic localtunnel fallback when Cloudflare quick tunnels are unavailable.
+- Requests a deterministic localtunnel URL when no public URL is provided, with random localtunnel and Cloudflare quick tunnel fallback when needed.
 - Writes `~/.devspace/config.json` and `~/.devspace/auth.json` with `0600` permissions.
 - Verifies OAuth discovery locally and over HTTPS.
 - Verifies `/mcp` returns `401` without OAuth, so the endpoint is not open.
@@ -46,16 +46,17 @@ Use multiple roots only when needed:
 node scripts/devspace_manager.mjs harness --roots "/path/project,/path/other"
 ```
 
-The harness returns the ChatGPT connector URL as `publicMcpUrl`, usually:
+The harness returns the ChatGPT connector URL as `publicMcpUrl`. DevSpace Manager first requests a deterministic localtunnel URL for this machine:
 
 ```text
-https://<generated>.trycloudflare.com/mcp
+https://devspace<machine-id>.loca.lt/mcp
 ```
 
-If Cloudflare quick tunnels are rate-limited or unavailable, DevSpace Manager automatically falls back to a localtunnel URL:
+If the deterministic localtunnel subdomain is unavailable, DevSpace Manager automatically falls back to a random localtunnel or Cloudflare quick tunnel URL. The returned `publicMcpUrl` is always the source of truth:
 
 ```text
 https://<generated>.loca.lt/mcp
+https://<generated>.trycloudflare.com/mcp
 ```
 
 ## Connect ChatGPT
@@ -117,7 +118,7 @@ If all ChatGPT app delivery methods fail, the command fails closed with a diagno
 
 DevSpace gives the connected MCP client local file and shell capability inside approved roots. Keep `--roots` narrow. Avoid using `~`, `/`, or broad workspace parents unless you intentionally want ChatGPT to reach everything under them.
 
-Cloudflare quick tunnels and localtunnel fallback are useful for live tests but are not production uptime guarantees. For stable long-running use, configure a named Cloudflare Tunnel, ngrok domain, Tailscale Funnel, or another HTTPS reverse proxy and pass it with:
+localtunnel and Cloudflare quick tunnels are useful for live tests but are not production uptime guarantees. For stable long-running use, configure a named Cloudflare Tunnel, ngrok domain, Tailscale Funnel, or another HTTPS reverse proxy and pass it with:
 
 ```bash
 node scripts/devspace_manager.mjs start --public-base-url "https://devspace.example.com" --roots "/path/project"

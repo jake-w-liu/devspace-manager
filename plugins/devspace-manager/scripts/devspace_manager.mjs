@@ -585,6 +585,8 @@ function isRetryableTunnelError(error) {
   const message = error instanceof Error ? error.message : String(error);
   return message.includes("Cloudflare tunnel URL") ||
     message.includes("Cloudflare tunnel hostname") ||
+    message.includes("Localtunnel") ||
+    message.includes("Unable to start a public HTTPS tunnel") ||
     message.includes("public OAuth discovery");
 }
 
@@ -2835,13 +2837,13 @@ async function httpStatusWithResolvedPublicDns(url) {
 }
 
 function ensureAnyTunnelCommand() {
-  if (commandExists("cloudflared") || commandExists("npx")) return;
-  throw new Error("Missing required tunnel command: install cloudflared or npx for localtunnel fallback.");
+  if (commandExists("cloudflared") || localtunnelCommandAvailable()) return;
+  throw new Error("Missing required tunnel command: install cloudflared, or install both node and npx for localtunnel fallback.");
 }
 
 async function startPublicTunnel(port) {
   const failures = [];
-  if (commandExists("npx")) {
+  if (localtunnelCommandAvailable()) {
     try {
       return {
         provider: "localtunnel",
@@ -2859,7 +2861,7 @@ async function startPublicTunnel(port) {
       failures.push(`localtunnel random: ${error instanceof Error ? error.message : String(error)}`);
     }
   } else {
-    failures.push("localtunnel: npx command not found");
+    failures.push("localtunnel: node or npx command not found");
   }
 
   if (commandExists("cloudflared")) {
@@ -2882,8 +2884,8 @@ function startCloudflared(port) {
   writeFileSync(CLOUDFLARED_LOG, "", { mode: 0o600 });
   const pid = startDetached("cloudflared", ["tunnel", "--url", `http://127.0.0.1:${port}`], CLOUDFLARED_LOG);
   writeFileSync(join(MANAGER_DIR, "cloudflared.pid"), String(pid), { mode: 0o600 });
-  return waitForCloudflaredUrl().catch((error) => {
-    killPidGroup(pid, "cloudflared");
+  return waitForCloudflaredUrl().catch(async (error) => {
+    await waitForKilledProcesses(killPidGroup(pid, "cloudflared"));
     safeRemoveFile(join(MANAGER_DIR, "cloudflared.pid"), "managed cloudflared pid file");
     throw error;
   });
@@ -2896,11 +2898,15 @@ function startLocaltunnel(port, { stable }) {
   if (expectedSubdomain) args.push("--subdomain", expectedSubdomain);
   const pid = startDetached("npx", args, LOCALTUNNEL_LOG);
   writeFileSync(join(MANAGER_DIR, "localtunnel.pid"), String(pid), { mode: 0o600 });
-  return waitForLocaltunnelUrl({ expectedSubdomain }).catch((error) => {
-    killPidGroup(pid, "localtunnel");
+  return waitForLocaltunnelUrl({ expectedSubdomain }).catch(async (error) => {
+    await waitForKilledProcesses(killPidGroup(pid, "localtunnel"));
     safeRemoveFile(join(MANAGER_DIR, "localtunnel.pid"), "managed localtunnel pid file");
     throw error;
   });
+}
+
+function localtunnelCommandAvailable() {
+  return commandExists("node") && commandExists("npx");
 }
 
 function stableLocaltunnelSubdomain() {

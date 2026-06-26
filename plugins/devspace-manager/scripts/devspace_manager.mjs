@@ -7,6 +7,7 @@ import { request as httpsRequest } from "node:https";
 import {
   appendFileSync,
   chmodSync,
+  closeSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -447,11 +448,12 @@ async function start(options) {
   const attempts = options.publicBaseUrl || options.noTunnel ? 1 : 3;
   let lastError;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    const lifecycle = { changedRuntimeState: false };
     try {
-      return await startOnce({ ...options, reuse: attempt === 1 && options.reuse });
+      return await startOnce({ ...options, reuse: attempt === 1 && options.reuse }, lifecycle);
     } catch (error) {
       lastError = error;
-      await stop({ print: false });
+      if (lifecycle.changedRuntimeState) await stop({ print: false });
       if (attempt >= attempts || !isRetryableTunnelError(error)) throw error;
       await sleep(1_000);
     }
@@ -459,11 +461,14 @@ async function start(options) {
   throw lastError;
 }
 
-async function startOnce(options) {
+async function startOnce(options, lifecycle = { changedRuntimeState: false }) {
   const port = parsePort(options.port ?? DEFAULT_PORT);
   const roots = parseRoots(options.roots ?? process.cwd());
+  const requestedPublicBaseUrl = options.publicBaseUrl
+    ? normalizePublicBaseUrl(options.publicBaseUrl)
+    : null;
   ensureCommand("devspace");
-  if (!options.noTunnel && !options.publicBaseUrl) ensureCommand("cloudflared");
+  if (!options.noTunnel && !requestedPublicBaseUrl) ensureCommand("cloudflared");
   mkdirSync(MANAGER_DIR, { recursive: true });
   assertManagerWritable();
 
@@ -474,10 +479,11 @@ async function startOnce(options) {
   }
 
   await stop({ print: false });
+  lifecycle.changedRuntimeState = true;
   assertPortFree(port);
 
-  const publicBaseUrl = options.publicBaseUrl
-    ? normalizePublicBaseUrl(options.publicBaseUrl)
+  const publicBaseUrl = requestedPublicBaseUrl
+    ? requestedPublicBaseUrl
     : options.noTunnel
       ? `http://127.0.0.1:${port}`
       : await startCloudflared(port);
@@ -1791,11 +1797,23 @@ function startDetached(command, args, logPath, env = process.env) {
   mkdirSync(dirname(logPath), { recursive: true });
   appendFileSync(logPath, `\n--- ${new Date().toISOString()} ${command} ${args.join(" ")} ---\n`, { mode: 0o600 });
   chmodSync(logPath, 0o600);
-  const child = spawn(command, args, {
-    detached: true,
-    env,
-    stdio: ["ignore", openForAppend(logPath), openForAppend(logPath)],
-  });
+  const stdoutFd = openForAppend(logPath);
+  const stderrFd = openForAppend(logPath);
+  let child;
+  try {
+    child = spawn(command, args, {
+      detached: true,
+      env,
+      stdio: ["ignore", stdoutFd, stderrFd],
+    });
+  } finally {
+    closeSync(stdoutFd);
+    closeSync(stderrFd);
+  }
+  if (!Number.isInteger(child.pid) || child.pid <= 0) {
+    throw new Error(`Failed to start ${command}; no child pid was returned.`);
+  }
+  child.on("error", () => {});
   child.unref();
   return child.pid;
 }
@@ -1874,6 +1892,9 @@ function parsePort(port) {
 
 function normalizePublicBaseUrl(value) {
   const parsed = new URL(value);
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error(`--public-base-url must use http:// or https://, got: ${parsed.protocol}`);
+  }
   parsed.hash = "";
   parsed.search = "";
   parsed.pathname = parsed.pathname.replace(/\/mcp\/?$/, "").replace(/\/+$/, "");

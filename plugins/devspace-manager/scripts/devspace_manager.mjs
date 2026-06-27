@@ -46,7 +46,7 @@ const LOCALTUNNEL_LOG = join(MANAGER_DIR, "localtunnel.log");
 const URL_RE = /https:\/\/[-a-z0-9]+\.trycloudflare\.com/i;
 const LOCALTUNNEL_URL_RE = /https:\/\/[-a-z0-9]+\.loca\.lt/i;
 const TASK_ALIAS_COMMANDS = new Set(["audit", "debug", "review", "fix", "analyze"]);
-const DEFAULT_CHATGPT_SEND = "chatgpt-app-auto";
+const DEFAULT_CHATGPT_SEND = "chatgpt-app-hidden";
 const CHATGPT_SEND_TARGETS = new Set([
   "chatgpt-app",
   "chatgpt-app-auto",
@@ -547,7 +547,10 @@ async function startOnce(options, lifecycle = { changedRuntimeState: false }) {
   writeDevspaceFiles({ port, roots, publicBaseUrl });
   const devspaceEnv = {
     ...process.env,
-    DEVSPACE_TRUST_PROXY: publicBaseUrl.startsWith("https://") ? "1" : (process.env.DEVSPACE_TRUST_PROXY ?? "0"),
+    // DevSpace currently maps this flag to Express `trust proxy = true`.
+    // express-rate-limit rejects that permissive setting, so keep it disabled
+    // and rely on the configured publicBaseUrl for generated OAuth metadata.
+    DEVSPACE_TRUST_PROXY: "0",
   };
   const devspacePid = startDetached("devspace", ["serve"], DEVSPACE_LOG, devspaceEnv);
   const status = {
@@ -1228,8 +1231,39 @@ function selfTest() {
 
   assertCheck("hidden ChatGPT target is background-only", isBackgroundOnlySendTarget("chatgpt-app-hidden") === true);
   assertCheck("legacy ChatGPT target is background-only", isBackgroundOnlySendTarget("chatgpt-app") === true);
-  assertCheck("automatic ChatGPT target reports visible fallback possibility", isBackgroundOnlySendTarget("chatgpt-app-auto") === false);
+  assertCheck("automatic ChatGPT target is background-only", isBackgroundOnlySendTarget("chatgpt-app-auto") === true);
   assertCheck("visible ChatGPT target is not background-only", isBackgroundOnlySendTarget("chatgpt-app-visible") === false);
+  assertCheck("default ChatGPT target is hidden", DEFAULT_CHATGPT_SEND === "chatgpt-app-hidden");
+  assertCheck("task prompt requires transcript completion", buildChatGptTaskPrompt({
+    task: "audit",
+    status: { publicMcpUrl: "https://example.test/mcp", allowedRoots: ["/tmp/project", "/tmp/exchange"] },
+    root: "/tmp/project",
+    exchangeRoot: "/tmp/exchange",
+    resultFileName: "result.md",
+    doneToken: "DONE",
+    promptId: "prompt-1",
+    allowEdits: false,
+  }).includes("return the complete final answer in this ChatGPT conversation"));
+  assertCheck("task prompt has connector-not-configured sentinel", buildChatGptTaskPrompt({
+    task: "audit",
+    status: { publicMcpUrl: "https://example.test/mcp", allowedRoots: ["/tmp/project", "/tmp/exchange"] },
+    root: "/tmp/project",
+    exchangeRoot: "/tmp/exchange",
+    resultFileName: "result.md",
+    doneToken: "DONE",
+    promptId: "prompt-1",
+    allowEdits: false,
+  }).includes("DEVSPACE_MANAGER_CONNECTOR_NOT_CONFIGURED"));
+  assertCheck("live-check prompt requires transcript marker reply", buildChatGptLiveCheckPrompt({
+    status: { publicMcpUrl: "https://example.test/mcp" },
+    root: "/tmp/project",
+    exchangeRoot: "/tmp/exchange",
+    relativeMarkerPath: "marker.txt",
+    resultFileName: "result.txt",
+    promptId: "prompt-2",
+  }).includes("Reply in this ChatGPT conversation with exactly the marker line"));
+  assertCheck("CoreGraphics window-state probe is non-activating", !/\.activate\(/.test(CHATGPT_CG_WINDOW_STATE_SWIFT));
+  assertCheck("hidden Accessibility automation reads roles through AX methods", CHATGPT_HIDDEN_AX_JXA.includes("return element.role();"));
   assertCheck("JSON-RPC null id does not equal string null", jsonRpcIdEquals(null, "null") === false);
   assertCheck("unknown macOS session state is not safe for GUI automation", macSessionStateAllowsGuiAutomation({ ok: false }) === false);
   assertCheck("locked macOS session state is not safe for GUI automation", macSessionStateAllowsGuiAutomation({ ok: true, screenLocked: true }) === false);
@@ -1386,7 +1420,7 @@ function buildChatGptTaskPrompt({ task, status, root, exchangeRoot, resultFileNa
     `- Result exchange workspace path to open when finished: ${exchangeRoot}`,
     `- Result file to write inside the result exchange workspace: ${resultFileName}`,
     `- Allowed roots: ${status.allowedRoots.join(", ")}`,
-    "- If the connector is not already configured in ChatGPT, ask the user to add the MCP connector URL above and authorize with the Owner password from this local command: jq -r .ownerToken ~/.devspace/auth.json",
+    "- If the DevSpace connector is not configured, say exactly: DEVSPACE_MANAGER_CONNECTOR_NOT_CONFIGURED",
     "",
     "Required DevSpace workflow:",
     "1. Call open_workspace with the workspace path above.",
@@ -1394,9 +1428,9 @@ function buildChatGptTaskPrompt({ task, status, root, exchangeRoot, resultFileNa
     "3. Use read, grep/glob/ls when available, and bash for builds, tests, package scripts, git inspection, and other read-only command-line inspection.",
     "4. Verify every finding against actual files or command output before stating it.",
     `5. ${editInstruction}`,
-    "6. When finished, open the result exchange workspace path above and write the final answer to the result file above through DevSpace. The last line of the file must be exactly:",
+    "6. When finished, return the complete final answer in this ChatGPT conversation. The last line must be exactly:",
     doneToken,
-    "7. If and only if you cannot write the result file through DevSpace, return the complete final answer in this ChatGPT conversation instead, and make the last line exactly the same token above.",
+    "7. If DevSpace write access is available, also open the result exchange workspace path above and write the same final answer to the result file above. The ChatGPT conversation response is still required and is sufficient for read-only delegation.",
     "",
     "Task:",
     task,
@@ -1429,9 +1463,8 @@ function buildChatGptLiveCheckPrompt({ status, root, exchangeRoot, relativeMarke
     "1. Use the DevSpace MCP connector, not uploaded files or pasted source.",
     "2. Call open_workspace with the workspace path above.",
     "3. Read the marker file path above through DevSpace.",
-    "4. Open the result exchange workspace path above.",
-    "5. Write exactly the marker line from that file, and nothing else, to the result file above through DevSpace.",
-    "6. If and only if you can read the marker through DevSpace but cannot write the result file, reply in this ChatGPT conversation with exactly the marker line and nothing else.",
+    "4. Reply in this ChatGPT conversation with exactly the marker line from that file, and nothing else.",
+    "5. If DevSpace write access is available, also open the result exchange workspace path above and write exactly the same marker line to the result file above.",
     "",
     "The marker value is intentionally not included in this prompt. You must read the file through DevSpace to know it.",
   ].join("\n");
@@ -1464,7 +1497,9 @@ async function sendPromptWithChatGptAppResult(args) {
 }
 
 function isBackgroundOnlySendTarget(sendTarget) {
-  return sendTarget === "chatgpt-app" || sendTarget === "chatgpt-app-hidden";
+  return sendTarget === "chatgpt-app" ||
+    sendTarget === "chatgpt-app-auto" ||
+    sendTarget === "chatgpt-app-hidden";
 }
 
 async function sendPromptWithChatGptApp({ prompt, timeoutMs, guiWaitMs = DEFAULT_GUI_WAIT_MS, resultFilePath, expectText, sendTarget = DEFAULT_CHATGPT_SEND }) {
@@ -1572,8 +1607,8 @@ async function sendPromptWithChatGptApp({ prompt, timeoutMs, guiWaitMs = DEFAULT
     appSnapshot: lastAppSnapshot,
     appSnapshotError: lastAppSnapshotError,
     reason: expectText
-      ? "Timed out waiting for ChatGPT to write the expected text to the DevSpace result file."
-      : "Timed out waiting for ChatGPT to write a DevSpace result file.",
+      ? "Timed out waiting for ChatGPT to return the expected text in the app transcript or DevSpace result file."
+      : "Timed out waiting for ChatGPT to return a response in the app transcript or DevSpace result file.",
   };
 }
 
@@ -1927,34 +1962,14 @@ function fail(code, message) {
 
 function sendPromptWithChatGptTransport(prompt, sendTarget) {
   if (sendTarget === "chatgpt-app-visible") return sendPromptWithVisibleChatGpt(prompt);
-  if (sendTarget === "chatgpt-app-hidden" || sendTarget === "chatgpt-app") {
+  if (sendTarget === "chatgpt-app-hidden" || sendTarget === "chatgpt-app" || sendTarget === "chatgpt-app-auto") {
     return sendPromptWithHiddenChatGptAccessibility(prompt);
   }
-  if (sendTarget !== DEFAULT_CHATGPT_SEND) {
-    throw new Error(`Unsupported ChatGPT send target: ${sendTarget}`);
-  }
-  try {
-    return sendPromptWithHiddenChatGptAccessibility(prompt);
-  } catch (error) {
-    const reason = error instanceof Error ? error.message : String(error);
-    const hiddenAttempt = { ok: false, reason };
-    try {
-      const fallback = sendPromptWithVisibleChatGpt(prompt);
-      return {
-        ...fallback,
-        hiddenAttempt,
-      };
-    } catch (visibleError) {
-      throw attachChatGptAttempts(visibleError, {
-        hiddenAttempt,
-        visibleAttempt: failedAttemptFromError(visibleError),
-      });
-    }
-  }
+  throw new Error(`Unsupported ChatGPT send target: ${sendTarget}`);
 }
 
 function sendPromptWithHiddenChatGptAccessibility(prompt) {
-  const launch = spawnSync("/usr/bin/open", ["-gj", "-b", "com.openai.chat"], {
+  const launch = spawnSync("/usr/bin/open", ["-gj", "-b", "com.openai.chat", "-u", "chatgpt://new-conversation"], {
     encoding: "utf8",
     timeout: 15_000,
     maxBuffer: 1024 * 1024,
@@ -1987,7 +2002,7 @@ function sendPromptWithHiddenChatGptAccessibility(prompt) {
     delivery,
     hideState: finalHide.state,
     promptBytes: Buffer.byteLength(prompt, "utf8"),
-    responseMode: "devspace-result-file",
+    responseMode: "chatgpt-app-transcript-or-devspace-result-file",
   };
 }
 
@@ -2037,7 +2052,7 @@ function sendPromptWithVisibleChatGptAx(prompt) {
     windowState,
     finalHide,
     promptBytes: Buffer.byteLength(prompt, "utf8"),
-    responseMode: "devspace-result-file",
+    responseMode: "chatgpt-app-transcript-or-devspace-result-file",
   };
 }
 
@@ -2093,7 +2108,7 @@ function sendPromptWithVisibleChatGptKeyboard(prompt) {
     windowState,
     finalHide,
     promptBytes: Buffer.byteLength(prompt, "utf8"),
-    responseMode: "devspace-result-file",
+    responseMode: "chatgpt-app-transcript-or-devspace-result-file",
   };
 }
 
@@ -2508,8 +2523,6 @@ func emit(_ value: [String: Any]) {
 
 let apps = NSRunningApplication.runningApplications(withBundleIdentifier: "com.openai.chat")
 let app = apps.first
-let activated = app?.activate(options: [.activateAllWindows]) ?? false
-Thread.sleep(forTimeInterval: 0.25)
 let frontmostBundleId = NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? ""
 let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
 let windows = list.compactMap { item -> [String: Any]? in
@@ -2538,10 +2551,43 @@ emit([
   "ok": true,
   "source": "coregraphics",
   "appRunning": app != nil,
-  "activationRequested": activated,
+  "appHidden": app?.isHidden ?? false,
   "frontmostBundleId": frontmostBundleId,
   "windows": windows.count,
   "window": windows.first ?? NSNull(),
+])
+`;
+
+const CHATGPT_HIDE_SWIFT = String.raw`
+import AppKit
+import CoreGraphics
+import Foundation
+
+func emit(_ value: [String: Any]) {
+  if let data = try? JSONSerialization.data(withJSONObject: value, options: []),
+     let text = String(data: data, encoding: .utf8) {
+    print(text)
+  } else {
+    print("{\"ok\":false,\"code\":\"CHATGPT_HIDE_JSON_FAILED\",\"message\":\"Could not serialize ChatGPT hide state.\"}")
+  }
+}
+
+let apps = NSRunningApplication.runningApplications(withBundleIdentifier: "com.openai.chat")
+let app = apps.first
+let hideRequested = app?.hide() ?? false
+Thread.sleep(forTimeInterval: 0.25)
+let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+let windows = list.filter { item in
+  String(describing: item[kCGWindowOwnerName as String] ?? "") == "ChatGPT" &&
+    ((item[kCGWindowLayer as String] as? Int ?? -1) == 0)
+}
+emit([
+  "ok": true,
+  "appRunning": app != nil,
+  "hideRequested": hideRequested,
+  "appHidden": app?.isHidden ?? false,
+  "frontmostBundleId": NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "",
+  "onscreenWindows": windows.count,
 ])
 `;
 
@@ -3159,9 +3205,9 @@ function dismissBlockingAlerts(proc) {
   var windows = [];
   try { windows = proc.windows(); } catch (_) {}
   for (var i = 0; i < windows.length; i++) {
-    var sheets = collectByRole(windows[i], 0, /Sheet|Dialog/i, []);
+    var sheets = collectByRole(windows[i], 0, /Sheet|Dialog/i, [], false);
     for (var j = 0; j < sheets.length; j++) {
-      var buttons = collectByRole(sheets[j].element, 0, /Button/i, []);
+      var buttons = collectByRole(sheets[j].element, 0, /Button/i, [], true);
       for (var k = 0; k < buttons.length; k++) {
         var label = String(buttons[k].label || "");
         if (/(^| )OK( |$)|(^| )Close( |$)|(^| )Dismiss( |$)/i.test(label)) {
@@ -3176,18 +3222,31 @@ function dismissBlockingAlerts(proc) {
 }
 
 function findComposer(window) {
-  var records = collect(window, 0, []);
-  for (var i = 0; i < records.length; i++) {
-    var record = records[i];
-    if (!/TextArea|TextField|TextView/i.test(record.role || "")) continue;
-    if (record.enabled === false) continue;
-    return record;
+  var stack = [{ element: window, depth: 0 }];
+  var visited = 0;
+  while (stack.length > 0 && visited < 2000) {
+    var current = stack.pop();
+    visited += 1;
+    var record = elementRecord(current.element, false);
+    if (
+      record &&
+      /TextArea|TextField|TextView/i.test(record.role || "") &&
+      record.enabled !== false
+    ) {
+      return record;
+    }
+    if (current.depth >= 10) continue;
+    var children = [];
+    try { children = current.element.uiElements(); } catch (_) {}
+    for (var i = children.length - 1; i >= 0; i--) {
+      stack.push({ element: children[i], depth: current.depth + 1 });
+    }
   }
   return null;
 }
 
 function findSendButton(window, composer) {
-  var records = collect(window, 0, []);
+  var records = collectByRole(window, 0, /Button/i, [], true);
   var best = null;
   var bestScore = -Infinity;
   for (var i = 0; i < records.length; i++) {
@@ -3211,23 +3270,16 @@ function findSendButton(window, composer) {
   return bestScore > 0 ? best : null;
 }
 
-function collect(element, depth, records) {
-  if (depth > 10) return records;
-  var record = elementRecord(element);
-  if (record) records.push(record);
-  var children = [];
-  try { children = element.uiElements(); } catch (_) {}
-  for (var i = 0; i < children.length; i++) collect(children[i], depth + 1, records);
-  return records;
-}
-
-function collectByRole(element, depth, pattern, records) {
-  if (depth > 10) return records;
-  var record = elementRecord(element);
+function collectByRole(element, depth, pattern, records, includeLabel) {
+  if (depth > 10 || records.length > 400) return records;
+  var record = elementRecord(element, includeLabel);
   if (record && pattern.test(record.role || "")) records.push(record);
   var children = [];
   try { children = element.uiElements(); } catch (_) {}
-  for (var i = 0; i < children.length; i++) collectByRole(children[i], depth + 1, pattern, records);
+  for (var i = 0; i < children.length; i++) {
+    collectByRole(children[i], depth + 1, pattern, records, includeLabel);
+    if (records.length > 400) break;
+  }
   return records;
 }
 
@@ -3236,7 +3288,7 @@ function debugUiSummary(proc) {
   try { windows = proc.windows(); } catch (_) {}
   var summary = [];
   for (var i = 0; i < windows.length && summary.length < 80; i++) {
-    var records = collect(windows[i], 0, []);
+    var records = collectSummary(windows[i], 0, []);
     for (var j = 0; j < records.length && summary.length < 80; j++) {
       summary.push({
         role: records[j].role,
@@ -3250,15 +3302,26 @@ function debugUiSummary(proc) {
   return JSON.stringify({ state: processState(proc), summary: summary });
 }
 
-function elementRecord(element) {
+function collectSummary(element, depth, records) {
+  if (depth > 6 || records.length > 80) return records;
+  var record = elementRecord(element, true);
+  if (record) records.push(record);
+  var children = [];
+  try { children = element.uiElements(); } catch (_) {}
+  for (var i = 0; i < children.length && records.length <= 80; i++) {
+    collectSummary(children[i], depth + 1, records);
+  }
+  return records;
+}
+
+function elementRecord(element, includeLabel) {
   var role = String(readProperty(element, "role") || "");
-  var name = readProperty(element, "name");
-  var description = readProperty(element, "description");
-  var value = readProperty(element, "value");
+  var name = includeLabel ? readProperty(element, "name") : "";
+  var description = includeLabel ? readProperty(element, "description") : "";
   var position = readProperty(element, "position");
   var size = readProperty(element, "size");
   var enabled = readProperty(element, "enabled");
-  var label = [String(description || ""), String(name || ""), String(value || "")].join(" ").replace(/\s+/g, " ").trim();
+  var label = [String(description || ""), String(name || "")].join(" ").replace(/\s+/g, " ").trim();
   return { element: element, role: role, label: label, position: position, size: size, enabled: enabled };
 }
 
@@ -3288,12 +3351,17 @@ function press(element) {
 
 function readProperty(element, propertyName) {
   try {
-    var value = element[propertyName];
-    if (typeof value === "function") return value.call(element);
-    return value;
+    if (propertyName === "role") return element.role();
+    if (propertyName === "name") return element.name();
+    if (propertyName === "description") return element.description();
+    if (propertyName === "value") return element.value();
+    if (propertyName === "position") return element.position();
+    if (propertyName === "size") return element.size();
+    if (propertyName === "enabled") return element.enabled();
   } catch (_) {
     return null;
   }
+  return null;
 }
 
 function publicRecord(record) {
@@ -3347,7 +3415,7 @@ function readTextFileIfExists(path) {
 }
 
 function hideChatGptApp() {
-  const hide = spawnSync("/usr/bin/osascript", [
+  spawnSync("/usr/bin/osascript", [
     "-e",
     'tell application "System Events" to if exists process "ChatGPT" then set visible of process "ChatGPT" to false',
   ], {
@@ -3355,15 +3423,17 @@ function hideChatGptApp() {
     timeout: 10_000,
     maxBuffer: 1024 * 1024,
   });
-  if (hide.error) throw new Error(`Unable to hide ChatGPT after deep link: ${hide.error.message}`);
-  if (hide.status !== 0) {
-    throw new Error(`Unable to hide ChatGPT after deep link: ${preview(hide.stderr || hide.stdout)}`);
-  }
+  const appHide = runChatGptSwiftJson(CHATGPT_HIDE_SWIFT, "CHATGPT_HIDE", 10_000);
+  if (!appHide.ok) throw new Error(`Unable to hide ChatGPT after deep link: ${appHide.message || appHide.code || "unknown error"}`);
   const state = chatGptVisibilityState();
-  if (state.exists && state.visible) {
-    throw new Error("ChatGPT remained visible after hidden deep-link delivery.");
+  const coreGraphics = chatGptCoreGraphicsWindowState();
+  if (state.exists && (state.visible || state.frontmost)) {
+    throw new Error(`ChatGPT remained active after hidden delivery: ${JSON.stringify(state)}`);
   }
-  return state;
+  if (coreGraphics.ok && coreGraphics.windows > 0) {
+    throw new Error(`ChatGPT still has onscreen windows after hidden delivery: ${JSON.stringify(coreGraphics.window ?? coreGraphics)}`);
+  }
+  return { ...state, coreGraphics, appHide };
 }
 
 function hideChatGptAppQuietly(attempts = 3) {
@@ -3938,22 +4008,24 @@ Usage:
   node scripts/devspace_manager.mjs start [--roots /path/a,/path/b] [--port 7676]
   node scripts/devspace_manager.mjs harness [--roots /path/a,/path/b] [--port 7676] [--deep] [--write-test]
   node scripts/devspace_manager.mjs debug [--roots /path/a] "debug audit this repo"
-  node scripts/devspace_manager.mjs task "deep debug audit this repo" [--roots /path/a] [--allow-edits] [--send chatgpt-app-auto|chatgpt-app-hidden|chatgpt-app-visible|none] [--gui-wait-ms 1800000]
+  node scripts/devspace_manager.mjs task "deep debug audit this repo" [--roots /path/a] [--allow-edits] [--send chatgpt-app-hidden|chatgpt-app-visible|none] [--gui-wait-ms 1800000]
   node scripts/devspace_manager.mjs self-test
   node scripts/devspace_manager.mjs status
   node scripts/devspace_manager.mjs doctor
   node scripts/devspace_manager.mjs stop
 
 The task command starts and verifies DevSpace, writes a ChatGPT-ready delegated task prompt,
-and sends that prompt through DevSpace Manager's built-in ChatGPT app control channel by default.
-The default sender is automatic: it tries hidden Accessibility first, then visible Accessibility,
-then visible keyboard paste, and hides ChatGPT again after visible submission.
+and sends that prompt through DevSpace Manager's built-in hidden ChatGPT app control channel by default.
+The default sender is background-only: it tries hidden Accessibility and never opens a foreground
+ChatGPT window. The normal audit/debug path is read-only: ChatGPT returns the delegated response in
+the app transcript, then Codex reads that transcript and performs local implementation.
 If the macOS GUI session is locked or not ready, ChatGPT GUI delivery waits in the same background
 task until the session is verified safe, then sends automatically. If the wait reaches
 --gui-wait-ms, delivery fails closed with the specific macOS session diagnostic instead of
 attempting unsafe paste automation.
+Use --send chatgpt-app-visible only when foreground ChatGPT automation is explicitly desired.
 Use --send none only to generate the prompt/result metadata without contacting ChatGPT.
-The debug/audit/review/fix/analyze aliases use the same task flow and default to --send chatgpt-app-auto.
+The debug/audit/review/fix/analyze aliases use the same task flow and default to --send chatgpt-app-hidden.
 Only one start/stop/task/harness command may run at a time.
 The Owner password is stored in ~/.devspace/auth.json.
 `);

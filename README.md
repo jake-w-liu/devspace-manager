@@ -15,7 +15,7 @@ DevSpace Manager does not upload project archives to ChatGPT. It starts a local 
 - Verifies `/mcp` returns `401` without OAuth, so the endpoint is not open.
 - Deep-tests OAuth token exchange and MCP calls against the allowed root.
 - Generates delegated task prompts for ChatGPT, sends them through its own ChatGPT app sender, and waits for ChatGPT to write results back through a DevSpace exchange root so Codex can outsource audits or fixes without zip upload/download. If ChatGPT can read through DevSpace but cannot write the result file, DevSpace Manager also captures the ChatGPT app transcript as a fallback response channel.
-- Uses automatic ChatGPT delivery by default: hidden Accessibility first, visible Accessibility next, visible keyboard paste last, then hides ChatGPT again after visible submission. If the macOS GUI session is locked or not ready, the same background task waits until the session is verified safe and then sends automatically. If the GUI wait expires, it fails closed with a diagnostic instead of attempting unsafe paste automation.
+- Uses hidden ChatGPT delivery by default. It never opens a foreground ChatGPT window unless `--send chatgpt-app-visible` is explicitly requested. The normal delegation path is read-only: ChatGPT returns the delegated result in the app transcript, then Codex reads that response and implements locally.
 
 ## Install In Codex
 
@@ -96,24 +96,28 @@ The command starts/verifies DevSpace, then writes:
 - a JSON result file under `~/.devspace/manager/tasks/*.json`
 - a per-task result exchange root under `~/.devspace/manager/exchange/<task>/`
 
-To be explicit about the automatic internal ChatGPT app sender:
+To be explicit about the internal hidden ChatGPT app sender:
 
 ```bash
-node scripts/devspace_manager.mjs task --roots "$PWD" --send chatgpt-app-auto "deep debug audit the codebase"
+node scripts/devspace_manager.mjs task --roots "$PWD" --send chatgpt-app-hidden "deep debug audit the codebase"
 ```
 
-`chatgpt-app-auto` tries hidden Accessibility first. If ChatGPT does not expose a hidden composer,
-it falls back to visible Accessibility automation and then visible keyboard paste. Visible fallback
-is transient: after submitting, the manager hides ChatGPT again. When the macOS GUI session is
-locked or not ready, GUI delivery waits in the same background task until the session is verified
-safe, then sends automatically. Control that wait with `--gui-wait-ms`; if the wait expires, the
-manager stops before paste/keyboard automation and reports the specific session diagnostic such as
-`CHATGPT_SCREEN_LOCKED`, `CHATGPT_NOT_ON_CONSOLE`, or `CHATGPT_SESSION_STATE_UNKNOWN`.
-Use `--send chatgpt-app-hidden` to
-require hidden-only behavior, or `--send chatgpt-app-visible` to force visible automation.
+`chatgpt-app-hidden` uses hidden Accessibility only. It does not open a foreground ChatGPT window
+and does not fall back to visible paste. The task prompt asks ChatGPT to return the delegated result
+in the app transcript; Codex then reads the transcript and performs local fixes. When the macOS GUI
+session is locked or not ready, GUI delivery waits in the same background task until the session is
+verified safe. Control that wait with `--gui-wait-ms`; if the wait expires, the manager stops and
+reports the specific session diagnostic such as `CHATGPT_SCREEN_LOCKED`, `CHATGPT_NOT_ON_CONSOLE`,
+or `CHATGPT_SESSION_STATE_UNKNOWN`.
+Use `--send chatgpt-app-visible` only when foreground ChatGPT automation is explicitly acceptable.
 
 Use `--send none` only when you want DevSpace Manager to prepare the prompt/result metadata without
 contacting ChatGPT.
+
+If `live-check` returns `connector-not-configured`, DevSpace Manager has verified background delivery
+to the ChatGPT app and transcript capture, but ChatGPT has not been configured with the DevSpace MCP
+connector for that workspace yet. The result JSON includes the exact connector URL and Owner password
+command under `connectorSetup`.
 
 That sends only instructions through the ChatGPT app. ChatGPT still reads, writes, and runs commands through the DevSpace MCP connector. Task completion is verified first by the result file ChatGPT writes back through DevSpace, and second by a captured ChatGPT app transcript only when the prompt's expected completion token is present there.
 

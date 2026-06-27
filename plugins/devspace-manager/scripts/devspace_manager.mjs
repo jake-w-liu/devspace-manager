@@ -24,6 +24,7 @@ import { dirname, relative, resolve, join } from "node:path";
 
 const DEFAULT_PORT = 7676;
 const DEFAULT_TASK_TIMEOUT_MS = 30 * 60 * 1000;
+const DEFAULT_GUI_WAIT_MS = DEFAULT_TASK_TIMEOUT_MS;
 const LOCAL_DISCOVERY_TIMEOUT_MS = 30_000;
 const PUBLIC_DISCOVERY_TIMEOUT_MS = 120_000;
 const QUICK_TUNNEL_URL_TIMEOUT_MS = 90_000;
@@ -202,6 +203,8 @@ function parseArgs(args) {
       }
     } else if (arg === "--timeout-ms") {
       options.timeoutMs = Number(requireOptionValue(args, ++i, arg));
+    } else if (arg === "--gui-wait-ms") {
+      options.guiWaitMs = Number(requireOptionValue(args, ++i, arg));
     } else if (arg === "--output-dir") {
       options.outputDir = requireOptionValue(args, ++i, arg);
     } else if (arg === "--prompt") {
@@ -350,6 +353,7 @@ async function task(options) {
     sendResult = await sendPromptWithChatGptAppResult({
       prompt: chatGptPrompt,
       timeoutMs: parseTimeoutMs(options.timeoutMs ?? DEFAULT_TASK_TIMEOUT_MS),
+      guiWaitMs: parseTimeoutMs(options.guiWaitMs ?? DEFAULT_GUI_WAIT_MS),
       resultFilePath,
       expectText: doneToken,
       sendTarget: options.send,
@@ -433,6 +437,7 @@ async function chatGptLiveCheck(options) {
     sendResult = await sendPromptWithChatGptAppResult({
       prompt: chatGptPrompt,
       timeoutMs: parseTimeoutMs(options.timeoutMs ?? DEFAULT_TASK_TIMEOUT_MS),
+      guiWaitMs: parseTimeoutMs(options.guiWaitMs ?? DEFAULT_GUI_WAIT_MS),
       resultFilePath,
       expectText: marker,
       sendTarget: options.send ?? DEFAULT_CHATGPT_SEND,
@@ -1229,6 +1234,9 @@ function selfTest() {
   assertCheck("unknown macOS session state is not safe for GUI automation", macSessionStateAllowsGuiAutomation({ ok: false }) === false);
   assertCheck("locked macOS session state is not safe for GUI automation", macSessionStateAllowsGuiAutomation({ ok: true, screenLocked: true }) === false);
   assertCheck("unlocked macOS session state is safe for GUI automation", macSessionStateAllowsGuiAutomation({ ok: true, screenLocked: false }) === true);
+  assertCheck("loginwindow frontmost is not safe for GUI automation", macSessionStateAllowsGuiAutomation({ ok: true, screenLocked: false, frontmostBundleId: "com.apple.loginwindow" }) === false);
+  assertCheck("not-on-console session reports a specific block code", macSessionStateBlockCode({ ok: true, screenLocked: false, onConsole: false }) === "CHATGPT_NOT_ON_CONSOLE");
+  assertCheck("locked session reports screen lock block code", macSessionStateBlockCode({ ok: true, screenLocked: true }) === "CHATGPT_SCREEN_LOCKED");
 
   printJson({ ok: true, checks });
 }
@@ -1459,14 +1467,14 @@ function isBackgroundOnlySendTarget(sendTarget) {
   return sendTarget === "chatgpt-app" || sendTarget === "chatgpt-app-hidden";
 }
 
-async function sendPromptWithChatGptApp({ prompt, timeoutMs, resultFilePath, expectText, sendTarget = DEFAULT_CHATGPT_SEND }) {
+async function sendPromptWithChatGptApp({ prompt, timeoutMs, guiWaitMs = DEFAULT_GUI_WAIT_MS, resultFilePath, expectText, sendTarget = DEFAULT_CHATGPT_SEND }) {
   if (process.platform !== "darwin") {
     throw new Error("ChatGPT app sending is only supported on macOS.");
   }
   if (!resultFilePath) {
     throw new Error("ChatGPT app sending requires a DevSpace result file path to poll.");
   }
-  assertMacSessionUnlocked("ChatGPT app sending");
+  const sessionWait = await waitForMacSessionGuiAutomation("ChatGPT app sending", guiWaitMs);
   safeRemoveFile(resultFilePath, "stale ChatGPT result file");
   const sent = sendPromptWithChatGptTransport(prompt, sendTarget);
   const started = Date.now();
@@ -1484,6 +1492,7 @@ async function sendPromptWithChatGptApp({ prompt, timeoutMs, resultFilePath, exp
         ok: true,
         status: "complete",
         transport: sent.transport,
+        sessionWait,
         delivery: sent,
         resultChannel: "devspace-result-file",
         resultFilePath,
@@ -1516,6 +1525,7 @@ async function sendPromptWithChatGptApp({ prompt, timeoutMs, resultFilePath, exp
           ok: true,
           status: "complete",
           transport: sent.transport,
+          sessionWait,
           delivery: sent,
           resultChannel: "chatgpt-app-transcript",
           resultFilePath,
@@ -1535,6 +1545,7 @@ async function sendPromptWithChatGptApp({ prompt, timeoutMs, resultFilePath, exp
           ok: false,
           status: "connector-not-configured",
           transport: sent.transport,
+          sessionWait,
           delivery: sent,
           resultChannel: "chatgpt-app-transcript",
           resultFilePath,
@@ -1553,6 +1564,7 @@ async function sendPromptWithChatGptApp({ prompt, timeoutMs, resultFilePath, exp
     ok: false,
     status: "timeout",
     transport: sent.transport,
+    sessionWait,
     delivery: sent,
     resultFilePath,
     finalDeliveryText: lastText,
@@ -2135,13 +2147,53 @@ function chatGptCoreGraphicsWindowState() {
   return runChatGptSwiftJson(CHATGPT_CG_WINDOW_STATE_SWIFT, "CHATGPT_CG_WINDOW_STATE", 20_000);
 }
 
+async function waitForMacSessionGuiAutomation(label, timeoutMs) {
+  const timeout = parseTimeoutMs(timeoutMs);
+  const started = Date.now();
+  let attempts = 0;
+  let state = null;
+  while (Date.now() - started < timeout) {
+    attempts += 1;
+    state = macSessionState();
+    if (macSessionStateAllowsGuiAutomation(state)) {
+      return {
+        ok: true,
+        waitedMs: Date.now() - started,
+        attempts,
+        state,
+      };
+    }
+    await sleep(Math.min(2_000, Math.max(100, timeout - (Date.now() - started))));
+  }
+
+  attempts += 1;
+  state = macSessionState();
+  if (macSessionStateAllowsGuiAutomation(state)) {
+    return {
+      ok: true,
+      waitedMs: Date.now() - started,
+      attempts,
+      state,
+    };
+  }
+
+  throw chatGptDiagnosticError(
+    macSessionStateBlockCode(state),
+    `Cannot run ${label} because the macOS GUI session was not automation-ready before ${timeout}ms.`,
+    {
+      timeoutMs: timeout,
+      waitedMs: Date.now() - started,
+      attempts,
+      state,
+    }
+  );
+}
+
 function assertMacSessionUnlocked(label) {
   const state = macSessionState();
   if (!macSessionStateAllowsGuiAutomation(state)) {
-    const code = state.ok ? "CHATGPT_SCREEN_LOCKED" : "CHATGPT_SESSION_STATE_UNKNOWN";
-    const reason = state.ok
-      ? `Cannot run ${label} while the macOS console session is locked.`
-      : `Cannot run ${label} because the macOS console lock state could not be verified.`;
+    const code = macSessionStateBlockCode(state);
+    const reason = macSessionStateBlockReason(label, state);
     throw chatGptDiagnosticError(
       code,
       reason,
@@ -2151,7 +2203,33 @@ function assertMacSessionUnlocked(label) {
 }
 
 function macSessionStateAllowsGuiAutomation(state) {
-  return state?.ok === true && state.screenLocked === false;
+  return state?.ok === true &&
+    state.screenLocked === false &&
+    state.onConsole !== false &&
+    state.loginDone !== false &&
+    state.frontmostBundleId !== "com.apple.loginwindow";
+}
+
+function macSessionStateBlockCode(state) {
+  if (state?.ok === true && state.screenLocked === true) return "CHATGPT_SCREEN_LOCKED";
+  if (state?.ok === true && state.onConsole === false) return "CHATGPT_NOT_ON_CONSOLE";
+  if (state?.ok === true && state.loginDone === false) return "CHATGPT_LOGIN_NOT_READY";
+  if (state?.ok === true && state.frontmostBundleId === "com.apple.loginwindow") return "CHATGPT_LOGINWINDOW_ACTIVE";
+  return "CHATGPT_SESSION_STATE_UNKNOWN";
+}
+
+function macSessionStateBlockReason(label, state) {
+  const code = macSessionStateBlockCode(state);
+  if (code === "CHATGPT_SCREEN_LOCKED") {
+    return `Cannot run ${label} while the macOS console session is locked.`;
+  }
+  if (code === "CHATGPT_NOT_ON_CONSOLE") {
+    return `Cannot run ${label} because the active macOS session is not on the console.`;
+  }
+  if (code === "CHATGPT_LOGIN_NOT_READY" || code === "CHATGPT_LOGINWINDOW_ACTIVE") {
+    return `Cannot run ${label} because the macOS login session is not ready for GUI automation.`;
+  }
+  return `Cannot run ${label} because the macOS console lock state could not be verified.`;
 }
 
 function collectChatGptDiagnostics() {
@@ -2172,7 +2250,79 @@ function collectChatGptDiagnostics() {
 }
 
 function macSessionState() {
-  return runChatGptSwiftJson(MAC_SESSION_STATE_SWIFT, "MAC_SESSION_STATE", 10_000);
+  const swiftState = runChatGptSwiftJson(MAC_SESSION_STATE_SWIFT, "MAC_SESSION_STATE", 10_000);
+  const ioregState = ioConsoleLockState();
+  if (swiftState.ok) {
+    const swiftHasLock = swiftState.screenLockedKeyPresent === true;
+    const ioregHasLock = ioregState.ok && typeof ioregState.screenLocked === "boolean";
+    return {
+      ...swiftState,
+      screenLocked: swiftHasLock
+        ? Boolean(swiftState.screenLocked)
+        : ioregHasLock
+          ? ioregState.screenLocked
+          : Boolean(swiftState.screenLocked),
+      lockStateSource: swiftHasLock
+        ? "CGSessionCopyCurrentDictionary"
+        : ioregHasLock
+          ? "IOConsoleLocked"
+          : "CGSessionCopyCurrentDictionary-default",
+      ioConsoleLocked: ioregHasLock ? ioregState.screenLocked : null,
+      ioConsoleLockState: ioregState,
+    };
+  }
+  if (ioregState.ok) {
+    return {
+      ok: true,
+      screenLocked: ioregState.screenLocked,
+      onConsole: null,
+      loginDone: null,
+      userName: "",
+      frontmostBundleId: "",
+      frontmostProcessName: "",
+      lockStateSource: "IOConsoleLocked-fallback",
+      swiftState,
+      ioConsoleLockState: ioregState,
+    };
+  }
+  return {
+    ...swiftState,
+    ioConsoleLockState: ioregState,
+  };
+}
+
+function ioConsoleLockState() {
+  if (process.platform !== "darwin") {
+    return { ok: false, code: "IOCONSOLELOCK_UNSUPPORTED", message: "IOConsole lock state is only available on macOS." };
+  }
+  const result = spawnSync("ioreg", ["-n", "Root", "-d1", "-a"], {
+    encoding: "utf8",
+    timeout: 5_000,
+    maxBuffer: 2 * 1024 * 1024,
+  });
+  if (result.error) {
+    return { ok: false, code: "IOCONSOLELOCK_FAILED", message: result.error.message };
+  }
+  if (result.status !== 0) {
+    return {
+      ok: false,
+      code: "IOCONSOLELOCK_FAILED",
+      message: preview(result.stderr || result.stdout),
+      status: result.status,
+    };
+  }
+  const match = result.stdout.match(/<key>IOConsoleLocked<\/key>\s*<(true|false)\/>/i);
+  if (!match) {
+    return {
+      ok: false,
+      code: "IOCONSOLELOCK_MISSING",
+      message: "ioreg output did not contain IOConsoleLocked.",
+    };
+  }
+  return {
+    ok: true,
+    screenLocked: match[1].toLowerCase() === "true",
+  };
 }
 
 function safeDiagnostic(callback) {
@@ -2328,9 +2478,11 @@ func emit(_ value: [String: Any]) {
 }
 
 let session = CGSessionCopyCurrentDictionary() as? [String: Any] ?? [:]
+let screenLockedValue = session["CGSSessionScreenIsLocked"]
 emit([
   "ok": true,
-  "screenLocked": (session["CGSSessionScreenIsLocked"] as? Int ?? 0) != 0,
+  "screenLocked": (screenLockedValue as? Int ?? 0) != 0,
+  "screenLockedKeyPresent": screenLockedValue != nil,
   "onConsole": (session["kCGSSessionOnConsoleKey"] as? Int ?? 0) != 0,
   "loginDone": (session["kCGSessionLoginDoneKey"] as? Int ?? 0) != 0,
   "userName": session["kCGSSessionUserNameKey"] as? String ?? "",
@@ -3786,7 +3938,7 @@ Usage:
   node scripts/devspace_manager.mjs start [--roots /path/a,/path/b] [--port 7676]
   node scripts/devspace_manager.mjs harness [--roots /path/a,/path/b] [--port 7676] [--deep] [--write-test]
   node scripts/devspace_manager.mjs debug [--roots /path/a] "debug audit this repo"
-  node scripts/devspace_manager.mjs task "deep debug audit this repo" [--roots /path/a] [--allow-edits] [--send chatgpt-app-auto|chatgpt-app-hidden|chatgpt-app-visible|none]
+  node scripts/devspace_manager.mjs task "deep debug audit this repo" [--roots /path/a] [--allow-edits] [--send chatgpt-app-auto|chatgpt-app-hidden|chatgpt-app-visible|none] [--gui-wait-ms 1800000]
   node scripts/devspace_manager.mjs self-test
   node scripts/devspace_manager.mjs status
   node scripts/devspace_manager.mjs doctor
@@ -3796,9 +3948,10 @@ The task command starts and verifies DevSpace, writes a ChatGPT-ready delegated 
 and sends that prompt through DevSpace Manager's built-in ChatGPT app control channel by default.
 The default sender is automatic: it tries hidden Accessibility first, then visible Accessibility,
 then visible keyboard paste, and hides ChatGPT again after visible submission.
-If the macOS console session is locked, ChatGPT GUI delivery fails fast with CHATGPT_SCREEN_LOCKED
-after DevSpace preflight instead of attempting unsafe paste automation.
-If the console lock state cannot be verified, delivery fails closed with CHATGPT_SESSION_STATE_UNKNOWN.
+If the macOS GUI session is locked or not ready, ChatGPT GUI delivery waits in the same background
+task until the session is verified safe, then sends automatically. If the wait reaches
+--gui-wait-ms, delivery fails closed with the specific macOS session diagnostic instead of
+attempting unsafe paste automation.
 Use --send none only to generate the prompt/result metadata without contacting ChatGPT.
 The debug/audit/review/fix/analyze aliases use the same task flow and default to --send chatgpt-app-auto.
 Only one start/stop/task/harness command may run at a time.

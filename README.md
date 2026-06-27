@@ -15,7 +15,7 @@ DevSpace Manager does not upload project archives to ChatGPT. It starts a local 
 - Verifies `/mcp` returns `401` without OAuth, so the endpoint is not open.
 - Deep-tests OAuth token exchange and MCP calls against the allowed root.
 - Generates delegated task prompts for ChatGPT, sends them through its own ChatGPT app sender, and waits for ChatGPT to write results back through a DevSpace exchange root so Codex can outsource audits or fixes without zip upload/download. If ChatGPT can read through DevSpace but cannot write the result file, DevSpace Manager also captures the ChatGPT app transcript as a fallback response channel.
-- Uses automatic ChatGPT delivery by default: hidden Accessibility first, visible Accessibility next, visible keyboard paste last, then hides ChatGPT again after visible submission. If the macOS console session is locked or cannot be verified as unlocked, it fails fast with a diagnostic instead of attempting unsafe paste automation.
+- Uses automatic ChatGPT delivery by default: hidden Accessibility first, visible Accessibility next, visible keyboard paste last, then hides ChatGPT again after visible submission. If the macOS GUI session is locked or not ready, the same background task waits until the session is verified safe and then sends automatically. If the GUI wait expires, it fails closed with a diagnostic instead of attempting unsafe paste automation.
 
 ## Install In Codex
 
@@ -104,9 +104,11 @@ node scripts/devspace_manager.mjs task --roots "$PWD" --send chatgpt-app-auto "d
 
 `chatgpt-app-auto` tries hidden Accessibility first. If ChatGPT does not expose a hidden composer,
 it falls back to visible Accessibility automation and then visible keyboard paste. Visible fallback
-is transient: after submitting, the manager hides ChatGPT again. When the macOS console session is
-locked or cannot be verified as unlocked, GUI delivery stops before paste/keyboard automation and
-reports `CHATGPT_SCREEN_LOCKED` or `CHATGPT_SESSION_STATE_UNKNOWN`.
+is transient: after submitting, the manager hides ChatGPT again. When the macOS GUI session is
+locked or not ready, GUI delivery waits in the same background task until the session is verified
+safe, then sends automatically. Control that wait with `--gui-wait-ms`; if the wait expires, the
+manager stops before paste/keyboard automation and reports the specific session diagnostic such as
+`CHATGPT_SCREEN_LOCKED`, `CHATGPT_NOT_ON_CONSOLE`, or `CHATGPT_SESSION_STATE_UNKNOWN`.
 Use `--send chatgpt-app-hidden` to
 require hidden-only behavior, or `--send chatgpt-app-visible` to force visible automation.
 
